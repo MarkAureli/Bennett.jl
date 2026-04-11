@@ -36,9 +36,10 @@ Compile a plain Julia function into a reversible circuit via LLVM IR.
 Uses LLVM.jl to walk the IR as typed objects (no regex parsing).
 """
 function reversible_compile(f, arg_types::Type{<:Tuple};
-                            optimize::Bool=true, max_loop_iterations::Int=0)
+                            optimize::Bool=true, max_loop_iterations::Int=0,
+                            compact_calls::Bool=false)
     parsed = extract_parsed_ir(f, arg_types; optimize)
-    lr = lower(parsed; max_loop_iterations)
+    lr = lower(parsed; max_loop_iterations, compact_calls)
     return bennett(lr)
 end
 
@@ -116,7 +117,8 @@ soft_fdiv etc., eliminating struct-passing ABI and producing clean integer IR
 with direct `call @j_soft_fdiv` instructions that the callee registry recognizes.
 """
 function reversible_compile(f::F, float_types::Type{Float64}...;
-                            optimize::Bool=true, max_loop_iterations::Int=0) where {F}
+                            optimize::Bool=true, max_loop_iterations::Int=0,
+                            compact_calls::Bool=false) where {F}
     N = length(float_types)
     N >= 1 || error("Need at least one Float64 argument type")
 
@@ -127,13 +129,13 @@ function reversible_compile(f::F, float_types::Type{Float64}...;
     # with direct soft_* calls that the callee registry recognizes.
     if N == 1
         w = (x::UInt64) -> (@inline f(SoftFloat(x))).bits
-        return reversible_compile(w, UInt64; optimize, max_loop_iterations)
+        return reversible_compile(w, UInt64; optimize, max_loop_iterations, compact_calls)
     elseif N == 2
         w = (a::UInt64, b::UInt64) -> (@inline f(SoftFloat(a), SoftFloat(b))).bits
-        return reversible_compile(w, UInt64, UInt64; optimize, max_loop_iterations)
+        return reversible_compile(w, UInt64, UInt64; optimize, max_loop_iterations, compact_calls)
     elseif N == 3
         w = (a::UInt64, b::UInt64, c::UInt64) -> (@inline f(SoftFloat(a), SoftFloat(b), SoftFloat(c))).bits
-        return reversible_compile(w, UInt64, UInt64, UInt64; optimize, max_loop_iterations)
+        return reversible_compile(w, UInt64, UInt64, UInt64; optimize, max_loop_iterations, compact_calls)
     else
         error("Float64 compile supports up to 3 arguments (got $N)")
     end

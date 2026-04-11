@@ -168,7 +168,7 @@ end
 # ==== main lowering entry point ====
 
 function lower(parsed::ParsedIR; max_loop_iterations::Int=0, use_inplace::Bool=true,
-               use_karatsuba::Bool=false, fold_constants::Bool=false)
+               use_karatsuba::Bool=false, fold_constants::Bool=false, compact_calls::Bool=false)
     wa = WireAllocator()
     gates = ReversibleGate[]
     vw = Dict{Symbol,Vector{Int}}()
@@ -254,7 +254,7 @@ function lower(parsed::ParsedIR; max_loop_iterations::Int=0, use_inplace::Bool=t
             end
         else
             lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_order;
-                               block_pred, ssa_liveness, inst_counter, gate_groups, use_karatsuba)
+                               block_pred, ssa_liveness, inst_counter, gate_groups, use_karatsuba, compact_calls)
         end
 
         # Process terminator (for non-loop blocks AND after loop unrolling)
@@ -419,7 +419,8 @@ function lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_orde
                            ssa_liveness::Dict{Symbol,Int}=Dict{Symbol,Int}(),
                            inst_counter::Ref{Int}=Ref(0),
                            gate_groups::Vector{GateGroup}=GateGroup[],
-                           use_karatsuba::Bool=false)
+                           use_karatsuba::Bool=false,
+                           compact_calls::Bool=false)
     for inst in block.instructions
         inst_counter[] += 1
         _ws = wa.next_wire
@@ -446,7 +447,7 @@ function lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_orde
         elseif inst isa IRInsertValue
             lower_insertvalue!(gates, wa, vw, inst)
         elseif inst isa IRCall
-            lower_call!(gates, wa, vw, inst)
+            lower_call!(gates, wa, vw, inst; compact=compact_calls)
         else
             error("Unhandled instruction type: $(typeof(inst)) — $(inst)")
         end
@@ -1370,37 +1371,65 @@ connected via CNOT-copy from the caller's argument wires, and the callee's
 output wires become the caller's result wires.
 """
 function lower_call!(gates::Vector{ReversibleGate}, wa::WireAllocator,
-                     vw::Dict{Symbol,Vector{Int}}, inst::IRCall)
+                     vw::Dict{Symbol,Vector{Int}}, inst::IRCall;
+                     compact::Bool=false)
     # Pre-compile the callee function
     arg_types = Tuple{(UInt64 for _ in inst.args)...}
     callee_parsed = extract_parsed_ir(inst.callee, arg_types)
-
     callee_lr = lower(callee_parsed; max_loop_iterations=64)
 
-    # Wire offset: remap all callee wires into the caller's wire space
-    wire_offset = wire_count(wa)
-    # Reserve wires in the caller's allocator
-    allocate!(wa, callee_lr.n_wires)
+    if compact
+        # Apply Bennett to callee: forward + copy output + reverse.
+        # This frees all intermediate wires, keeping only the output.
+        callee_circuit = bennett(callee_lr)
 
-    # Connect caller arguments → callee input wires (CNOT copy)
-    for (i, arg_op) in enumerate(inst.args)
-        caller_wires = resolve!(gates, wa, vw, arg_op, inst.arg_widths[i])
-        w = inst.arg_widths[i]
-        callee_start = sum(callee_parsed.args[j][2] for j in 1:(i-1); init=0)
-        for bit in 1:w
-            callee_wire = callee_lr.input_wires[callee_start + bit] + wire_offset
-            push!(gates, CNOTGate(caller_wires[bit], callee_wire))
+        wire_offset = wire_count(wa)
+        allocate!(wa, callee_circuit.n_wires)
+
+        # Connect caller arguments → callee input wires (CNOT copy)
+        for (i, arg_op) in enumerate(inst.args)
+            caller_wires = resolve!(gates, wa, vw, arg_op, inst.arg_widths[i])
+            w = inst.arg_widths[i]
+            callee_start = sum(callee_parsed.args[j][2] for j in 1:(i-1); init=0)
+            for bit in 1:w
+                callee_wire = callee_circuit.input_wires[callee_start + bit] + wire_offset
+                push!(gates, CNOTGate(caller_wires[bit], callee_wire))
+            end
         end
-    end
 
-    # Insert callee's forward gates with wire offset
-    for g in callee_lr.gates
-        push!(gates, _remap_gate(g, wire_offset))
-    end
+        # Insert ALL callee gates (forward + copy + reverse) with wire offset
+        for g in callee_circuit.gates
+            push!(gates, _remap_gate(g, wire_offset))
+        end
 
-    # The callee's output wires (remapped) become the result
-    result_wires = [w + wire_offset for w in callee_lr.output_wires]
-    vw[inst.dest] = result_wires
+        # The callee's output wires (remapped) are the Bennett copy wires
+        result_wires = [w + wire_offset for w in callee_circuit.output_wires]
+        vw[inst.dest] = result_wires
+    else
+        # Original behavior: insert only forward gates, caller's Bennett handles cleanup
+        wire_offset = wire_count(wa)
+        allocate!(wa, callee_lr.n_wires)
+
+        # Connect caller arguments → callee input wires (CNOT copy)
+        for (i, arg_op) in enumerate(inst.args)
+            caller_wires = resolve!(gates, wa, vw, arg_op, inst.arg_widths[i])
+            w = inst.arg_widths[i]
+            callee_start = sum(callee_parsed.args[j][2] for j in 1:(i-1); init=0)
+            for bit in 1:w
+                callee_wire = callee_lr.input_wires[callee_start + bit] + wire_offset
+                push!(gates, CNOTGate(caller_wires[bit], callee_wire))
+            end
+        end
+
+        # Insert callee's forward gates with wire offset
+        for g in callee_lr.gates
+            push!(gates, _remap_gate(g, wire_offset))
+        end
+
+        # The callee's output wires (remapped) become the result
+        result_wires = [w + wire_offset for w in callee_lr.output_wires]
+        vw[inst.dest] = result_wires
+    end
 end
 
 function _remap_gate(g::NOTGate, offset::Int)
