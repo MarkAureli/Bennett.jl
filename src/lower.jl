@@ -35,6 +35,60 @@ LoweringResult(gates, n_wires, input_wires, output_wires,
     LoweringResult(gates, n_wires, input_wires, output_wires,
                    input_widths, output_elem_widths, constant_wires, GateGroup[])
 
+"""Bundles shared lowering state for instruction dispatch."""
+struct LoweringCtx
+    gates::Vector{ReversibleGate}
+    wa::WireAllocator
+    vw::Dict{Symbol,Vector{Int}}
+    preds::Any    # Dict{Symbol,Vector{Symbol}} — typed Any to accept any dict shape from caller
+    branch_info::Any
+    block_order::Any
+    block_pred::Dict{Symbol,Vector{Int}}
+    ssa_liveness::Dict{Symbol,Int}
+    inst_counter::Ref{Int}
+    use_karatsuba::Bool
+    compact_calls::Bool
+end
+
+# Dispatched instruction lowering — Julia selects the method by inst type
+_lower_inst!(ctx::LoweringCtx, inst::IRPhi, label::Symbol) =
+    lower_phi!(ctx.gates, ctx.wa, ctx.vw, inst, label, ctx.preds, ctx.branch_info, ctx.block_order;
+               block_pred=ctx.block_pred)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRBinOp, ::Symbol) =
+    lower_binop!(ctx.gates, ctx.wa, ctx.vw, inst;
+                 ssa_liveness=ctx.ssa_liveness, inst_idx=ctx.inst_counter[], use_karatsuba=ctx.use_karatsuba)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRICmp, ::Symbol) =
+    lower_icmp!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRSelect, ::Symbol) =
+    lower_select!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRCast, ::Symbol) =
+    lower_cast!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRPtrOffset, ::Symbol) =
+    lower_ptr_offset!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRVarGEP, ::Symbol) =
+    lower_var_gep!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRLoad, ::Symbol) =
+    lower_load!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRExtractValue, ::Symbol) =
+    lower_extractvalue!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRInsertValue, ::Symbol) =
+    lower_insertvalue!(ctx.gates, ctx.wa, ctx.vw, inst)
+
+_lower_inst!(ctx::LoweringCtx, inst::IRCall, ::Symbol) =
+    lower_call!(ctx.gates, ctx.wa, ctx.vw, inst; compact=ctx.compact_calls)
+
+_lower_inst!(::LoweringCtx, inst::IRInst, ::Symbol) =
+    error("Unhandled instruction type: $(typeof(inst)) — $(inst)")
+
 # ---- operand resolution ----
 
 function resolve!(gates::Vector{ReversibleGate}, wa::WireAllocator,
@@ -421,36 +475,14 @@ function lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_orde
                            gate_groups::Vector{GateGroup}=GateGroup[],
                            use_karatsuba::Bool=false,
                            compact_calls::Bool=false)
+    ctx = LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
+                      block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls)
     for inst in block.instructions
         inst_counter[] += 1
         _ws = wa.next_wire
         _gs = length(gates) + 1
-        if inst isa IRPhi
-            lower_phi!(gates, wa, vw, inst, block.label, preds, branch_info, block_order;
-                       block_pred)
-        elseif inst isa IRBinOp
-            lower_binop!(gates, wa, vw, inst; ssa_liveness, inst_idx=inst_counter[], use_karatsuba)
-        elseif inst isa IRICmp
-            lower_icmp!(gates, wa, vw, inst)
-        elseif inst isa IRSelect
-            lower_select!(gates, wa, vw, inst)
-        elseif inst isa IRCast
-            lower_cast!(gates, wa, vw, inst)
-        elseif inst isa IRPtrOffset
-            lower_ptr_offset!(gates, wa, vw, inst)
-        elseif inst isa IRVarGEP
-            lower_var_gep!(gates, wa, vw, inst)
-        elseif inst isa IRLoad
-            lower_load!(gates, wa, vw, inst)
-        elseif inst isa IRExtractValue
-            lower_extractvalue!(gates, wa, vw, inst)
-        elseif inst isa IRInsertValue
-            lower_insertvalue!(gates, wa, vw, inst)
-        elseif inst isa IRCall
-            lower_call!(gates, wa, vw, inst; compact=compact_calls)
-        else
-            error("Unhandled instruction type: $(typeof(inst)) — $(inst)")
-        end
+
+        _lower_inst!(ctx, inst, block.label)
 
         _ge = length(gates)
         if _ge >= _gs && hasproperty(inst, :dest)
