@@ -34,6 +34,11 @@ function _simulate(circuit::ReversibleCircuit, inputs::Tuple)
     return _read_output(bits, circuit.output_wires, circuit.output_elem_widths)
 end
 
+"""
+Read the output value from the simulation bit vector. Returns Int8/16/32/64
+for single-element outputs, or a Tuple for multi-element (insertvalue) outputs.
+Note: return type is inherently unstable (depends on circuit's output_elem_widths).
+"""
 function _read_output(bits, output_wires, elem_widths)
     if length(elem_widths) == 1
         return _read_int(bits, output_wires, 1, elem_widths[1])

@@ -128,17 +128,24 @@ struct ParsedIR
     args::Vector{Tuple{Symbol, Int}}
     blocks::Vector{IRBasicBlock}
     ret_elem_widths::Vector{Int}   # [8] for i8, [8,8] for [2 x i8]
+    _instructions_cache::Vector{IRInst}  # cached flattened instructions for backward compat
 end
 
-# Backward compat: parsed.instructions flattens all blocks
+# Constructor without cache (auto-computes)
+function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
+                  blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int})
+    insts = IRInst[]
+    for block in blocks
+        append!(insts, block.instructions)
+        push!(insts, block.terminator)
+    end
+    ParsedIR(ret_width, args, blocks, ret_elem_widths, insts)
+end
+
+# Backward compat: parsed.instructions returns cached flattened list
 function Base.getproperty(p::ParsedIR, name::Symbol)
     if name === :instructions
-        insts = IRInst[]
-        for block in getfield(p, :blocks)
-            append!(insts, block.instructions)
-            push!(insts, block.terminator)
-        end
-        return insts
+        return getfield(p, :_instructions_cache)
     else
         return getfield(p, name)
     end
