@@ -6,6 +6,18 @@
         @test simulate(circuit, (x, y)) == m(x, y)
     end
 
+    # Edge cases with negative values
+    edge_cases = [
+        (typemin(Int8), typemin(Int8)), (typemin(Int8), typemax(Int8)),
+        (typemax(Int8), typemin(Int8)), (typemax(Int8), typemax(Int8)),
+        (Int8(-1), Int8(-1)), (Int8(0), Int8(0)),
+        (Int8(-128), Int8(1)), (Int8(1), Int8(-128)),
+        (Int8(-1), Int8(0)), (Int8(0), Int8(-1)),
+    ]
+    for (x, y) in edge_cases
+        @test simulate(circuit, (x, y)) == m(x, y)
+    end
+
     @test verify_reversibility(circuit)
     println("  Two args: ", gate_count(circuit))
     print_circuit(circuit)
