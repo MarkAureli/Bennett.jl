@@ -92,7 +92,7 @@ function verify_reversibility(cc::ControlledCircuit; n_tests::Int=100)
         bits = zeros(Bool, c.n_wires)
         bits[cc.ctrl_wire] = rand(Bool)
         offset = 0
-        for (_, w) in enumerate(c.input_widths)
+        for w in c.input_widths
             for i in 1:w
                 bits[c.input_wires[offset + i]] = rand(Bool)
             end

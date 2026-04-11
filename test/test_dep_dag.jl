@@ -26,4 +26,31 @@
         @test length(dag.nodes) > 10
         println("  polynomial DAG: $(length(dag.nodes)) nodes")
     end
+
+    @testset "DAG edge correctness" begin
+        f(x::Int8) = x + Int8(1)
+        c = reversible_compile(f, Int8)
+        dag = Bennett.extract_dep_dag(c)
+
+        # Every pred/succ relationship must be symmetric
+        for (i, node) in enumerate(dag.nodes)
+            for pred_idx in node.preds
+                @test i in dag.nodes[pred_idx].succs
+            end
+            for succ_idx in node.succs
+                @test i in dag.nodes[succ_idx].preds
+            end
+        end
+
+        # No self-loops
+        for (i, node) in enumerate(dag.nodes)
+            @test !(i in node.preds)
+            @test !(i in node.succs)
+        end
+
+        # Output nodes should exist and have valid indices
+        for oi in dag.output_nodes
+            @test 1 <= oi <= length(dag.nodes)
+        end
+    end
 end

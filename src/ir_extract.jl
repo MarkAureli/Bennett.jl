@@ -850,8 +850,13 @@ end
 """Get the dereferenceable byte count from a pointer parameter, or 0 if unknown."""
 function _get_deref_bytes(func::LLVM.Function, param::LLVM.Argument)
     # Find the parameter index (1-based)
-    idx = findfirst(p -> p.ref == param.ref, collect(LLVM.parameters(func)))
-    idx === nothing && return 0
+    idx = 0
+    for p in LLVM.parameters(func)
+        idx += 1
+        p.ref == param.ref && @goto found_param
+    end
+    return 0
+    @label found_param
     # Check parameter attributes for dereferenceable(N)
     try
         for attr in LLVM.parameter_attributes(func, idx)

@@ -128,7 +128,7 @@ function verify_reversibility(c::ReversibleCircuit; n_tests::Int=100)
     for _ in 1:n_tests
         bits = zeros(Bool, c.n_wires)
         offset = 0
-        for (_, w) in enumerate(c.input_widths)
+        for w in c.input_widths
             for i in 1:w
                 bits[c.input_wires[offset + i]] = rand(Bool)
             end

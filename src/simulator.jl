@@ -1,6 +1,6 @@
-apply!(b::Vector{Bool}, g::NOTGate)     = (b[g.target] ⊻= true; nothing)
-apply!(b::Vector{Bool}, g::CNOTGate)    = (b[g.target] ⊻= b[g.control]; nothing)
-apply!(b::Vector{Bool}, g::ToffoliGate) = (b[g.target] ⊻= b[g.control1] & b[g.control2]; nothing)
+@inline apply!(b::Vector{Bool}, g::NOTGate)     = (b[g.target] ⊻= true; nothing)
+@inline apply!(b::Vector{Bool}, g::CNOTGate)    = (b[g.target] ⊻= b[g.control]; nothing)
+@inline apply!(b::Vector{Bool}, g::ToffoliGate) = (b[g.target] ⊻= b[g.control1] & b[g.control2]; nothing)
 
 function simulate(circuit::ReversibleCircuit, input::Integer)
     length(circuit.input_widths) == 1 || error("simulate(circuit, input) requires single-input circuit, got $(length(circuit.input_widths)) inputs")

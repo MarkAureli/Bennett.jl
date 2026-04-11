@@ -13,7 +13,7 @@
     println("  s(x) IR:\n", ir)
 
     circuit = reversible_compile(s, Int8)
-    for x in Int8(0):Int8(63)
+    for x in typemin(Int8):typemax(Int8)
         @test simulate(circuit, x) == s(x)
     end
     @test verify_reversibility(circuit)

@@ -15,8 +15,7 @@ struct GateGroup
     cleanup_wires::Vector{Int}  # wires guaranteed zero after forward (can be freed during replay)
 end
 
-# Backward-compatible constructors
-GateGroup(name, gs, ge, rw, ivars) = GateGroup(name, gs, ge, rw, ivars, 0, -1, Int[])
+# Default cleanup_wires to empty
 GateGroup(name, gs, ge, rw, ivars, ws, we) = GateGroup(name, gs, ge, rw, ivars, ws, we, Int[])
 
 struct LoweringResult
