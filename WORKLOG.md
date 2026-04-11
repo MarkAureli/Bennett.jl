@@ -1065,6 +1065,59 @@ bd show Bennett-6lb                               # details on MDD issue
 - Push before stopping: work is not done until `git push` succeeds
    robustness. Compute block predicates during lowering, use for phi resolution.
 
+## Session log — 2026-04-11 (continued): Documentation + narrow bit-width
+
+### Documentation added
+
+- `docs/src/tutorial.md` — 10-section walkthrough, all code snippets verified
+- `docs/src/api.md` — complete API reference for all exported functions
+- `docs/src/architecture.md` — 4-stage pipeline, file map, design rationale
+- README.md updated with Documentation section, corrected gate count baselines
+
+### Narrow bit-width compilation (`bit_width` parameter)
+
+Added `bit_width` kwarg to `reversible_compile`. Compiles Int8 functions as if
+they operated on W-bit integers. Implementation: `_narrow_ir()` post-processes
+the ParsedIR to replace all instruction widths before lowering.
+
+**Gate count scaling (x+1):**
+
+| Width | Gates | Wires |
+|-------|-------|-------|
+| Int1  | 11    | 6     |
+| Int2  | 22    | 8     |
+| Int3  | 35    | 11    |
+| Int4  | 48    | 14    |
+| Int8  | 100   | 26    |
+
+**Polynomial cost breakdown (Horner form: `(x+3)*x + 1`):**
+
+The multiplier dominates at every width. Even for Int2, `x*x` needs 42 gates
+and 15 ancillae due to the shift-and-add algorithm (O(W^2) Toffoli + O(W^2) wires).
+LLVM rewrites `x^2 + 3x + 1` into Horner form `(x+3)*x + 1`, so there's one multiply.
+
+| Operation | Int2 gates | Int2 wires | Int4 gates | Int4 wires |
+|-----------|-----------|------------|-----------|------------|
+| x+1       | 22        | 8          | 48        | 14         |
+| x+x       | 6         | 7          | 12        | 13         |
+| x*x       | 42        | 19         | 170       | 61         |
+| poly      | 80        | 25         | 256       | 71         |
+
+**Gotcha:** Signed comparisons change semantics at narrow widths. In 3-bit signed,
+values 4-7 are negative (-4 to -1). `sle` on 3-bit operands treats bit 2 as sign.
+Best for unsigned arithmetic or functions staying within the positive range.
+
+### Issues closed in this session (final count)
+
+59 review issues filed, 45 implemented + 14 deferred to future sessions:
+- **CRITICAL**: 4/4 done (phi fallback, name counter, remap validation, pebbling docs)
+- **HIGH**: 16/20 done (all correctness + testing, 3/4 code quality, 2/4 perf)
+- **MEDIUM**: 15/23 done (large refactors deferred)
+- **LOW**: 9/12 done (new features deferred)
+
+New test assertions added: ~5,600+ across 10 new test files.
+8 git commits for review fixes, 1 for docs, 1 for narrow bit-width.
+
 ## Session log — 2026-04-11: Mother of all code reviews
 
 ### What was done
