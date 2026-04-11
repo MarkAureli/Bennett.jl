@@ -1,0 +1,7 @@
+Manifest.toml
+*.pdf
+docs/reference_code/
+docs/literature/*.pdf
+docs/literature/**/*.pdf
+.claude/
+v0.1/

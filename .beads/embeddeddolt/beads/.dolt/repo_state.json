@@ -1,0 +1,29 @@
+{
+  "head": "refs/heads/main",
+  "remotes": {
+    "origin": {
+      "name": "origin",
+      "url": "git+ssh://git@github.com/tobiasosborne/research-notebook.git",
+      "fetch_specs": [
+        "refs/heads/*:refs/remotes/origin/*"
+      ],
+      "params": {}
+    }
+  },
+  "backups": {
+    "backup_export": {
+      "name": "backup_export",
+      "url": "file:///home/tobiasosborne/Projects/research-notebook/Bennett.jl/.beads/backup",
+      "fetch_specs": [
+        "refs/heads/*:refs/remotes/backup_export/*"
+      ],
+      "params": {}
+    }
+  },
+  "branches": {
+    "main": {
+      "head": "refs/heads/main",
+      "remote": "origin"
+    }
+  }
+}

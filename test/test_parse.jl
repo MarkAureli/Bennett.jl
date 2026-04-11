@@ -1,0 +1,48 @@
+@testset "IR Parsing" begin
+    @testset "Parse increment" begin
+        f(x::Int8) = x + Int8(3)
+        ir = extract_ir(f, Tuple{Int8})
+        parsed = parse_ir(ir)
+        @test length(parsed.args) == 1
+        @test parsed.ret_width == 8
+        @test any(i -> i isa Bennett.IRBinOp && i.op == :add, parsed.instructions)
+        @test any(i -> i isa Bennett.IRRet, parsed.instructions)
+        println("  IR for x+3:\n", ir)
+    end
+
+    @testset "Parse polynomial" begin
+        g(x::Int8) = x * x + Int8(3) * x + Int8(1)
+        ir = extract_ir(g, Tuple{Int8})
+        parsed = parse_ir(ir)
+        @test length(parsed.args) == 1
+        @test parsed.ret_width == 8
+        @test any(i -> i isa Bennett.IRBinOp && i.op == :mul, parsed.instructions)
+        println("  IR for x^2+3x+1:\n", ir)
+    end
+
+    @testset "Parse bitwise" begin
+        h(x::Int8) = (x & Int8(0x0f)) | (x >> 2)
+        ir = extract_ir(h, Tuple{Int8})
+        parsed = parse_ir(ir)
+        @test any(i -> i isa Bennett.IRBinOp && i.op == :and, parsed.instructions)
+        @test any(i -> i isa Bennett.IRBinOp && i.op == :or, parsed.instructions)
+        println("  IR for bitwise:\n", ir)
+    end
+
+    @testset "Parse compare+select" begin
+        k(x::Int8) = x > Int8(10) ? x + Int8(1) : x + Int8(2)
+        ir = extract_ir(k, Tuple{Int8})
+        parsed = parse_ir(ir)
+        @test any(i -> i isa Bennett.IRICmp, parsed.instructions)
+        @test any(i -> i isa Bennett.IRSelect, parsed.instructions)
+        println("  IR for compare+select:\n", ir)
+    end
+
+    @testset "Parse two-arg" begin
+        m(x::Int8, y::Int8) = x * y + x - y
+        ir = extract_ir(m, Tuple{Int8, Int8})
+        parsed = parse_ir(ir)
+        @test length(parsed.args) == 2
+        println("  IR for two-arg:\n", ir)
+    end
+end
