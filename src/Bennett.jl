@@ -37,11 +37,49 @@ Uses LLVM.jl to walk the IR as typed objects (no regex parsing).
 """
 function reversible_compile(f, arg_types::Type{<:Tuple};
                             optimize::Bool=true, max_loop_iterations::Int=0,
-                            compact_calls::Bool=false)
+                            compact_calls::Bool=false, bit_width::Int=0)
     parsed = extract_parsed_ir(f, arg_types; optimize)
+    if bit_width > 0
+        parsed = _narrow_ir(parsed, bit_width)
+    end
     lr = lower(parsed; max_loop_iterations, compact_calls)
     return bennett(lr)
 end
+
+"""
+    _narrow_ir(parsed::ParsedIR, W::Int) -> ParsedIR
+
+Narrow all widths in a ParsedIR to W bits. This enables compiling
+functions written for Int8 as if they operated on W-bit integers.
+All arithmetic wraps modulo 2^W.
+"""
+function _narrow_ir(parsed::ParsedIR, W::Int)
+    # Narrow arguments
+    new_args = [(name, W) for (name, _) in parsed.args]
+    # Narrow all instructions
+    new_blocks = IRBasicBlock[]
+    for block in parsed.blocks
+        new_insts = IRInst[]
+        for inst in block.instructions
+            push!(new_insts, _narrow_inst(inst, W))
+        end
+        new_term = _narrow_inst(block.terminator, W)
+        push!(new_blocks, IRBasicBlock(block.label, new_insts, new_term))
+    end
+    return ParsedIR(W, new_args, new_blocks, [W for _ in parsed.ret_elem_widths])
+end
+
+_narrow_inst(inst::IRBinOp, W::Int) = IRBinOp(inst.dest, inst.op, inst.op1, inst.op2, W)
+_narrow_inst(inst::IRICmp, W::Int) = IRICmp(inst.dest, inst.predicate, inst.op1, inst.op2, W)
+_narrow_inst(inst::IRSelect, W::Int) = IRSelect(inst.dest, inst.cond, inst.op1, inst.op2, W)
+_narrow_inst(inst::IRCast, W::Int) = IRCast(inst.dest, inst.op, inst.src_width, W, inst.operand)
+_narrow_inst(inst::IRRet, W::Int) = IRRet(inst.op, W)
+_narrow_inst(inst::IRPhi, W::Int) = IRPhi(inst.dest, inst.width > 1 ? W : 1, inst.incoming)
+_narrow_inst(inst::IRBranch, W::Int) = inst  # branches don't have widths
+_narrow_inst(inst::IRInsertValue, W::Int) = IRInsertValue(inst.dest, inst.agg, inst.val, inst.index, W, inst.elem_count)
+_narrow_inst(inst::IRExtractValue, W::Int) = IRExtractValue(inst.dest, inst.agg, inst.index, W)
+_narrow_inst(inst::IRCall, W::Int) = inst  # calls handle their own widths
+_narrow_inst(inst::IRInst, W::Int) = inst  # fallback: pass through
 
 # ---- Register soft-float functions for gate-level inlining ----
 register_callee!(soft_fadd)
