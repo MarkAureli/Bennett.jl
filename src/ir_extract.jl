@@ -52,20 +52,19 @@ end
 
 const _LLVMRef = LLVM.API.LLVMValueRef
 
-# Auto-name counter
-const _name_counter = Ref(0)
-function _reset_names!()
-    _name_counter[] = 0
+# Auto-name counter (passed as argument, not global state)
+function _auto_name(counter::Ref{Int})
+    counter[] += 1
+    Symbol("__v$(counter[])")
 end
-function _auto_name()
-    _name_counter[] += 1
-    Symbol("__v$(_name_counter[])")
-end
+
+# No-op for backward compatibility (counter is now local to each compilation)
+function _reset_names!() end
 
 # ---- module walking ----
 
 function _module_to_parsed_ir(mod::LLVM.Module)
-    _reset_names!()
+    counter = Ref(0)
 
     # Find the julia_ function with a body
     func = nothing
@@ -96,7 +95,7 @@ function _module_to_parsed_ir(mod::LLVM.Module)
     ptr_params = Dict{Symbol, Tuple{Symbol, Int}}()
     for p in LLVM.parameters(func)
         nm = LLVM.name(p)
-        sym = isempty(nm) ? _auto_name() : Symbol(nm)
+        sym = isempty(nm) ? _auto_name(counter) : Symbol(nm)
         names[p.ref] = sym
         ptype = LLVM.value_type(p)
         if ptype isa LLVM.IntegerType
@@ -122,7 +121,7 @@ function _module_to_parsed_ir(mod::LLVM.Module)
     for bb in LLVM.blocks(func)
         for inst in LLVM.instructions(bb)
             nm = LLVM.name(inst)
-            names[inst.ref] = isempty(nm) ? _auto_name() : Symbol(nm)
+            names[inst.ref] = isempty(nm) ? _auto_name(counter) : Symbol(nm)
         end
     end
 
@@ -134,7 +133,7 @@ function _module_to_parsed_ir(mod::LLVM.Module)
         terminator = nothing
 
         for inst in LLVM.instructions(bb)
-            ir_inst = _convert_instruction(inst, names)
+            ir_inst = _convert_instruction(inst, names, counter)
             ir_inst === nothing && continue
             if ir_inst isa Vector
                 for sub in ir_inst
@@ -262,7 +261,7 @@ end
 
 # ---- instruction conversion ----
 
-function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symbol})
+function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symbol}, counter::Ref{Int})
     opc = LLVM.opcode(inst)
     dest = names[inst.ref]
 
@@ -374,7 +373,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
         if n_ops >= 1
             cname = try LLVM.name(ops[n_ops]) catch; "" end
             if startswith(cname, "llvm.umax")
-                cmp_dest = _auto_name()
+                cmp_dest = _auto_name(counter)
                 w = _iwidth(ops[1])
                 return [
                     IRICmp(cmp_dest, :uge, _operand(ops[1], names), _operand(ops[2], names), w),
@@ -382,7 +381,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 ]
             end
             if startswith(cname, "llvm.umin")
-                cmp_dest = _auto_name()
+                cmp_dest = _auto_name(counter)
                 w = _iwidth(ops[1])
                 return [
                     IRICmp(cmp_dest, :ule, _operand(ops[1], names), _operand(ops[2], names), w),
@@ -390,7 +389,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 ]
             end
             if startswith(cname, "llvm.smax")
-                cmp_dest = _auto_name()
+                cmp_dest = _auto_name(counter)
                 w = _iwidth(ops[1])
                 return [
                     IRICmp(cmp_dest, :sge, _operand(ops[1], names), _operand(ops[2], names), w),
@@ -398,7 +397,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 ]
             end
             if startswith(cname, "llvm.smin")
-                cmp_dest = _auto_name()
+                cmp_dest = _auto_name(counter)
                 w = _iwidth(ops[1])
                 return [
                     IRICmp(cmp_dest, :sle, _operand(ops[1], names), _operand(ops[2], names), w),
@@ -409,8 +408,8 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
             if startswith(cname, "llvm.abs")
                 w = _iwidth(ops[1])
                 x_op = _operand(ops[1], names)
-                neg_dest = _auto_name()
-                cmp_dest = _auto_name()
+                neg_dest = _auto_name(counter)
+                cmp_dest = _auto_name(counter)
                 return [
                     IRBinOp(neg_dest, :sub, iconst(0), x_op, w),
                     IRICmp(cmp_dest, :sge, x_op, iconst(0), w),
@@ -425,12 +424,12 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 result = IRInst[]
                 # Extract each bit: bit_i = (x >> i) & 1
                 # Then sum them up: result = bit_0 + bit_1 + ... + bit_{W-1}
-                prev = _auto_name()
+                prev = _auto_name(counter)
                 push!(result, IRBinOp(prev, :and, x_op, iconst(1), w))
                 for i in 1:(w - 1)
-                    shifted = _auto_name()
-                    bit = _auto_name()
-                    acc = _auto_name()
+                    shifted = _auto_name(counter)
+                    bit = _auto_name(counter)
+                    acc = _auto_name(counter)
                     push!(result, IRBinOp(shifted, :lshr, x_op, iconst(i), w))
                     push!(result, IRBinOp(bit, :and, ssa(shifted), iconst(1), w))
                     push!(result, IRBinOp(acc, :add, ssa(prev), ssa(bit), w))
@@ -446,13 +445,13 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 w = _iwidth(ops[1])
                 x_op = _operand(ops[1], names)
                 result = IRInst[]
-                prev = _auto_name()
+                prev = _auto_name(counter)
                 push!(result, IRBinOp(prev, :add, iconst(w), iconst(0), w))  # default: W (all zeros)
                 for i in 0:(w - 1)  # LSB to MSB; last match = highest bit = correct clz
-                    shifted = _auto_name()
-                    bit = _auto_name()
-                    is_set = _auto_name()
-                    new_val = _auto_name()
+                    shifted = _auto_name(counter)
+                    bit = _auto_name(counter)
+                    is_set = _auto_name(counter)
+                    new_val = _auto_name(counter)
                     push!(result, IRBinOp(shifted, :lshr, x_op, iconst(i), w))
                     push!(result, IRBinOp(bit, :and, ssa(shifted), iconst(1), w))
                     push!(result, IRICmp(is_set, :ne, ssa(bit), iconst(0), w))
@@ -468,13 +467,13 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 w = _iwidth(ops[1])
                 x_op = _operand(ops[1], names)
                 result = IRInst[]
-                prev = _auto_name()
+                prev = _auto_name(counter)
                 push!(result, IRBinOp(prev, :add, iconst(w), iconst(0), w))
                 for i in (w - 1):-1:0  # MSB to LSB; last match = lowest bit = correct ctz
-                    shifted = _auto_name()
-                    bit = _auto_name()
-                    is_set = _auto_name()
-                    new_val = _auto_name()
+                    shifted = _auto_name(counter)
+                    bit = _auto_name(counter)
+                    is_set = _auto_name(counter)
+                    new_val = _auto_name(counter)
                     push!(result, IRBinOp(shifted, :lshr, x_op, iconst(i), w))
                     push!(result, IRBinOp(bit, :and, ssa(shifted), iconst(1), w))
                     push!(result, IRICmp(is_set, :ne, ssa(bit), iconst(0), w))
@@ -491,19 +490,19 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 x_op = _operand(ops[1], names)
                 result = IRInst[]
                 # bit_i → position (W-1-i): shift right by i, mask, shift left by (W-1-i)
-                prev = _auto_name()
+                prev = _auto_name(counter)
                 # First bit
-                shifted0 = _auto_name()
+                shifted0 = _auto_name(counter)
                 push!(result, IRBinOp(shifted0, :lshr, x_op, iconst(0), w))
                 push!(result, IRBinOp(prev, :and, ssa(shifted0), iconst(1), w))
-                shl0 = _auto_name()
+                shl0 = _auto_name(counter)
                 push!(result, IRBinOp(shl0, :shl, ssa(prev), iconst(w - 1), w))
                 prev = shl0
                 for i in 1:(w - 1)
-                    shifted = _auto_name()
-                    bit = _auto_name()
-                    placed = _auto_name()
-                    acc = _auto_name()
+                    shifted = _auto_name(counter)
+                    bit = _auto_name(counter)
+                    placed = _auto_name(counter)
+                    acc = _auto_name(counter)
                     push!(result, IRBinOp(shifted, :lshr, x_op, iconst(i), w))
                     push!(result, IRBinOp(bit, :and, ssa(shifted), iconst(1), w))
                     push!(result, IRBinOp(placed, :shl, ssa(bit), iconst(w - 1 - i), w))
@@ -520,15 +519,15 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 n_bytes = w ÷ 8
                 result = IRInst[]
                 # Extract each byte, shift to swapped position, OR together
-                prev = _auto_name()
-                byte0 = _auto_name()
+                prev = _auto_name(counter)
+                byte0 = _auto_name(counter)
                 push!(result, IRBinOp(byte0, :and, x_op, iconst(255), w))
                 push!(result, IRBinOp(prev, :shl, ssa(byte0), iconst((n_bytes - 1) * 8), w))
                 for b in 1:(n_bytes - 1)
-                    shifted = _auto_name()
-                    byte_val = _auto_name()
-                    placed = _auto_name()
-                    acc = _auto_name()
+                    shifted = _auto_name(counter)
+                    byte_val = _auto_name(counter)
+                    placed = _auto_name(counter)
+                    acc = _auto_name(counter)
                     push!(result, IRBinOp(shifted, :lshr, x_op, iconst(b * 8), w))
                     push!(result, IRBinOp(byte_val, :and, ssa(shifted), iconst(255), w))
                     push!(result, IRBinOp(placed, :shl, ssa(byte_val), iconst((n_bytes - 1 - b) * 8), w))
@@ -544,8 +543,8 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 a_op = _operand(ops[1], names)
                 b_op = _operand(ops[2], names)
                 sh_op = _operand(ops[3], names)
-                shl_dest = _auto_name()
-                lshr_dest = _auto_name()
+                shl_dest = _auto_name(counter)
+                lshr_dest = _auto_name(counter)
                 if sh_op.kind == :const
                     # Constant-fold: w - const is const (no runtime sub needed)
                     return [
@@ -554,7 +553,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                         IRBinOp(dest, :or, ssa(shl_dest), ssa(lshr_dest), w),
                     ]
                 else
-                    rsh_amount = _auto_name()
+                    rsh_amount = _auto_name(counter)
                     return [
                         IRBinOp(shl_dest, :shl, a_op, sh_op, w),
                         IRBinOp(rsh_amount, :sub, iconst(w), sh_op, w),
@@ -569,8 +568,8 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 a_op = _operand(ops[1], names)
                 b_op = _operand(ops[2], names)
                 sh_op = _operand(ops[3], names)
-                shl_dest = _auto_name()
-                lshr_dest = _auto_name()
+                shl_dest = _auto_name(counter)
+                lshr_dest = _auto_name(counter)
                 if sh_op.kind == :const
                     # Constant-fold: w - const is const
                     return [
@@ -579,7 +578,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                         IRBinOp(dest, :or, ssa(shl_dest), ssa(lshr_dest), w),
                     ]
                 else
-                    shl_amount = _auto_name()
+                    shl_amount = _auto_name(counter)
                     return [
                         IRBinOp(shl_amount, :sub, iconst(w), sh_op, w),
                         IRBinOp(shl_dest, :shl, a_op, ssa(shl_amount), w),
@@ -601,8 +600,8 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 sign_bit = w == 64 ? typemin(Int64) : Int(1 << (w - 1))
                 x_op = _operand(ops[1], names)
                 y_op = _operand(ops[2], names)
-                mag = _auto_name()
-                sgn = _auto_name()
+                mag = _auto_name(counter)
+                sgn = _auto_name(counter)
                 return [
                     IRBinOp(mag, :and, x_op, iconst(mag_mask), w),
                     IRBinOp(sgn, :and, y_op, iconst(sign_bit), w),
@@ -626,7 +625,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 w = _iwidth(ops[1])
                 x_op = _operand(ops[1], names)
                 y_op = _operand(ops[2], names)
-                cmp = _auto_name()
+                cmp = _auto_name(counter)
                 return [
                     IRICmp(cmp, :slt, x_op, y_op, w),
                     IRSelect(dest, ssa(cmp), x_op, y_op, w),
@@ -636,7 +635,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 w = _iwidth(ops[1])
                 x_op = _operand(ops[1], names)
                 y_op = _operand(ops[2], names)
-                cmp = _auto_name()
+                cmp = _auto_name(counter)
                 return [
                     IRICmp(cmp, :sgt, x_op, y_op, w),
                     IRSelect(dest, ssa(cmp), x_op, y_op, w),
@@ -742,7 +741,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
             else
                 # Need to truncate the 64-bit result to the target width
                 trunc_dest = dest
-                call_dest = _auto_name()
+                call_dest = _auto_name(counter)
                 return [
                     IRCall(call_dest, callee, [_operand(src, names)], [src_w], 64),
                     IRCast(dest, :trunc, ssa(call_dest), 64, dst_w),
@@ -764,7 +763,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 return IRCall(dest, callee, [_operand(src, names)], [src_w], dst_w)
             else
                 # Widen source to 64-bit first, then convert
-                widen_dest = _auto_name()
+                widen_dest = _auto_name(counter)
                 cast_op = opc == LLVM.API.LLVMSIToFP ? :sext : :zext
                 return [
                     IRCast(widen_dest, cast_op, _operand(src, names), src_w, 64),
@@ -806,7 +805,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
         callee === nothing && error("soft_fcmp callee not registered for fcmp predicate $pred_int")
         # soft_fcmp returns UInt64 (0 or 1), but fcmp result is i1.
         # Use IRCall with ret_width=1 and let lowering truncate.
-        call_dest = _auto_name()
+        call_dest = _auto_name(counter)
         return [
             IRCall(call_dest, callee, [op1, op2], [w, w], w),
             IRCast(dest, :trunc, ssa(call_dest), w, 1),

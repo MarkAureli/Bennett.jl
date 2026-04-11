@@ -1374,9 +1374,7 @@ function lower_call!(gates::Vector{ReversibleGate}, wa::WireAllocator,
                      vw::Dict{Symbol,Vector{Int}}, inst::IRCall)
     # Pre-compile the callee function
     arg_types = Tuple{(UInt64 for _ in inst.args)...}
-    saved_counter = _name_counter[]
     callee_parsed = extract_parsed_ir(inst.callee, arg_types)
-    _name_counter[] = saved_counter   # restore caller's name counter
 
     callee_lr = lower(callee_parsed; max_loop_iterations=64)
 

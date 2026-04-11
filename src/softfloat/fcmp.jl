@@ -6,8 +6,6 @@ Returns 1 if a < b (and neither is NaN), 0 otherwise.
 Fully branchless.
 """
 function soft_fcmp_olt(a::UInt64, b::UInt64)::UInt64
-    FRAC_MASK = UInt64(0x000FFFFFFFFFFFFF)
-    EXP_MASK  = UInt64(0x7FF0000000000000)
     SIGN_MASK = UInt64(0x8000000000000000)
     ABS_MASK  = UInt64(0x7FFFFFFFFFFFFFFF)
 
@@ -57,7 +55,6 @@ Note: +0.0 == -0.0 per IEEE 754.
 Fully branchless.
 """
 function soft_fcmp_oeq(a::UInt64, b::UInt64)::UInt64
-    FRAC_MASK = UInt64(0x000FFFFFFFFFFFFF)
     ABS_MASK  = UInt64(0x7FFFFFFFFFFFFFFF)
 
     ea = (a >> 52) & UInt64(0x7FF)

@@ -37,7 +37,6 @@ Uses LLVM.jl to walk the IR as typed objects (no regex parsing).
 """
 function reversible_compile(f, arg_types::Type{<:Tuple};
                             optimize::Bool=true, max_loop_iterations::Int=0)
-    _reset_names!()
     parsed = extract_parsed_ir(f, arg_types; optimize)
     lr = lower(parsed; max_loop_iterations)
     return bennett(lr)

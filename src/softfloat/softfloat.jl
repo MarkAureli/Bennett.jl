@@ -1,3 +1,4 @@
+include("softfloat_common.jl")
 include("fneg.jl")
 include("fadd.jl")
 include("fsub.jl")

@@ -12,12 +12,7 @@ widening multiply via four 27×26-bit partial products (schoolbook
 decomposition into half-words that fit in UInt64 without overflow).
 """
 function soft_fmul(a::UInt64, b::UInt64)::UInt64
-    # IEEE 754 double-precision constants
-    FRAC_MASK = UInt64(0x000FFFFFFFFFFFFF)   # 52-bit stored fraction
-    IMPLICIT  = UInt64(0x0010000000000000)   # bit 52 (implicit leading 1)
     SIGN_MASK = UInt64(0x8000000000000000)   # bit 63
-    INF_BITS  = UInt64(0x7FF0000000000000)   # +Inf
-    QNAN      = UInt64(0x7FF8000000000000)   # canonical quiet NaN
     BIAS      = Int64(1023)
 
     # ── Unpack ──
@@ -187,75 +182,16 @@ function soft_fmul(a::UInt64, b::UInt64)::UInt64
     wr = wr & ((UInt64(1) << 56) - UInt64(1))
 
     # ── Normalize subnormal inputs ──
-    # If either input was subnormal, the product's leading 1 may be lower.
-    # Use the same CLZ normalization as soft_fadd.
-    # The leading 1 should be at bit 55 of wr.
-    need32 = (wr & (UInt64(0xFFFFFFFF) << 24)) == UInt64(0)
-    wr = ifelse(need32, wr << 32, wr)
-    result_exp = ifelse(need32, result_exp - Int64(32), result_exp)
-
-    need16 = (wr & (UInt64(0xFFFF) << 40)) == UInt64(0)
-    wr = ifelse(need16, wr << 16, wr)
-    result_exp = ifelse(need16, result_exp - Int64(16), result_exp)
-
-    need8 = (wr & (UInt64(0xFF) << 48)) == UInt64(0)
-    wr = ifelse(need8, wr << 8, wr)
-    result_exp = ifelse(need8, result_exp - Int64(8), result_exp)
-
-    need4 = (wr & (UInt64(0xF) << 52)) == UInt64(0)
-    wr = ifelse(need4, wr << 4, wr)
-    result_exp = ifelse(need4, result_exp - Int64(4), result_exp)
-
-    need2 = (wr & (UInt64(0x3) << 54)) == UInt64(0)
-    wr = ifelse(need2, wr << 2, wr)
-    result_exp = ifelse(need2, result_exp - Int64(2), result_exp)
-
-    need1 = (wr & (UInt64(1) << 55)) == UInt64(0)
-    wr = ifelse(need1, wr << 1, wr)
-    result_exp = ifelse(need1, result_exp - Int64(1), result_exp)
+    # If either input was subnormal, normalize (leading 1 should be at bit 55).
+    (wr, result_exp) = _sf_normalize_clz(wr, result_exp)
 
     # ── Handle subnormal result (exponent underflow) ──
-    subnormal = result_exp <= Int64(0)
-    shift_sub = Int64(1) - result_exp
-    flush_to_zero = shift_sub >= Int64(56)
-    shift_clamped = clamp(shift_sub, Int64(0), Int64(63))
-    shift_u = UInt64(ifelse(flush_to_zero, Int64(0), shift_clamped))
-    lost_mask_sub = (UInt64(1) << shift_u) - UInt64(1)
-    lost_sub = ifelse((wr & lost_mask_sub) != UInt64(0), UInt64(1), UInt64(0))
-    wr_sub_result = (wr >> shift_u) | lost_sub
-    flushed_result = result_sign << 63
+    (wr, result_exp, flushed_result, subnormal, flush_to_zero) =
+        _sf_handle_subnormal(wr, result_exp, result_sign)
 
-    wr = ifelse(subnormal,
-         ifelse(flush_to_zero, wr, wr_sub_result),
-         wr)
-    result_exp = ifelse(subnormal, Int64(0), result_exp)
-
-    # ── Handle overflow to ±Inf ──
-    exp_overflow = result_exp >= Int64(0x7FF)
-    overflow_result = (result_sign << 63) | INF_BITS
-
-    # ── Round to nearest even ──
-    guard      = (wr >> 2) & UInt64(1)
-    round_bit  = (wr >> 1) & UInt64(1)
-    sticky_bit = wr & UInt64(1)
-    frac       = (wr >> 3) & FRAC_MASK
-
-    grs = (guard << 2) | (round_bit << 1) | sticky_bit
-    round_up = (grs > UInt64(4)) | ((grs == UInt64(4)) & ((frac & UInt64(1)) != UInt64(0)))
-
-    frac_rounded = frac + UInt64(1)
-    mant_overflow = frac_rounded == IMPLICIT
-    frac_final = ifelse(round_up,
-                 ifelse(mant_overflow, UInt64(0), frac_rounded),
-                 frac)
-    exp_after_round = ifelse(round_up & mant_overflow,
-                             result_exp + Int64(1),
-                             result_exp)
-    exp_overflow_after_round = exp_after_round >= Int64(0x7FF)
-
-    # ── Pack normal result ──
-    exp_pack = UInt64(clamp(exp_after_round, Int64(0), Int64(0x7FE)))
-    normal_result = (result_sign << 63) | (exp_pack << 52) | frac_final
+    # ── Round to nearest even + pack ──
+    (normal_result, overflow_result, exp_overflow, exp_overflow_after_round) =
+        _sf_round_and_pack(wr, result_exp, result_sign)
 
     # ── Final select chain ──
     result = normal_result
