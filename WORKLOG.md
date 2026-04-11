@@ -1,5 +1,15 @@
 # Bennett.jl Work Log
 
+## Migration note (2026-04-11)
+
+Migrated from `~/Projects/research-notebook/Bennett.jl/` (private dev repo) to
+`~/Projects/Bennett.jl/` (public standalone repo, https://github.com/tobiasosborne/Bennett.jl).
+The research-notebook copy is frozen as a development log record.
+
+**Next agent task:** Major architecture and code review of the public repo. Review all
+source files for code quality, dead code, documentation, test coverage. The beads issue
+tracker carries over with open issues.
+
 ## Project purpose
 
 Bennett.jl is an LLVM-level reversible compiler — the Enzyme of reversible
