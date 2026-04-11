@@ -108,18 +108,17 @@ This is the metric that EAGER cleanup optimizes — fewer simultaneously
 live wires means smaller physical qubit requirements.
 """
 function peak_live_wires(c::ReversibleCircuit)
-    nonzero = Set{Int}()
+    count_nonzero = 0
     peak = 0
     bits = zeros(Bool, c.n_wires)
     for g in c.gates
-        apply!(bits, g)
         t = _gate_target(g)
-        if bits[t]
-            push!(nonzero, t)
-        else
-            delete!(nonzero, t)
-        end
-        peak = max(peak, length(nonzero))
+        was_nonzero = bits[t]
+        apply!(bits, g)
+        is_nonzero = bits[t]
+        # Track count change: only the target wire can change
+        count_nonzero += Int(is_nonzero) - Int(was_nonzero)
+        peak = max(peak, count_nonzero)
     end
     return peak
 end
