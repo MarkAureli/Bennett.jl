@@ -2869,3 +2869,104 @@ julia --project benchmark/run_benchmarks.jl
 - One follow-up issue filed (Bennett-h8iw).
 
 The memory model works end-to-end. We are the first reversible compiler to handle arbitrary LLVM `store`/`alloca`. MD5 is within 1.75× of ReVerC's Toffoli count (under 2× constant factor on a real cryptographic benchmark — below the 4-5× ceiling the survey predicted). Paper-ready narrative secured. Next agent: keep the momentum on impl + benchmarks per user direction; paper drafting waits until T1c + BC.3/BC.4 + T2a + T3b land.
+
+## 2026-04-12 — Bennett-h8iw misdiagnosis recorded, closed (no code change)
+
+BC.1 re-analysis after Cuccaro paper re-read: Cuccaro dispatch IS firing for `f(a,b)=a+b` (161→98 wires, 65→2 ancillae). The 124 Toffoli count matches ripple-carry because both constructions emit ≈2(W-1)=62 raw Toffolis (ripple: 2 Toffolis per middle bit × 31; Cuccaro: 1 MAJ + 1 UMA per middle bit × 31), which Bennett doubles to 124.
+
+The real 2× is architectural: our Cuccaro is **self-uncomputing** (MAJ-ripple-up + UMA-ripple-down already restores the carry ancilla), so Bennett's reverse phase redundantly re-runs the full circuit. Exempting Cuccaro-emitted gates from Bennett reverse would halve the Toffoli count — tracked in Bennett-07r (Cuccaro+checkpoint mutual exclusivity), not here.
+
+Filed Bennett-gsxe: tighten `lower_add_cuccaro!` from 2(n-1)=62 to 2n-3=61 (Cuccaro 2004 Table 1 optimal for mod 2^n).
+
+## 2026-04-12 — T1c.1: Babbush-Gidney QROM primitive (Bennett-hz31)
+
+### Paper ground truth (Babbush-Gidney 2018, arXiv:1805.03662v2)
+
+§III.C Figure 10: read-only data lookup via **unary iteration** (§III.A Fig 7).
+A complete binary tree of AND gates over log₂(L) index bits produces L leaf-flags;
+exactly one leaf is active at runtime (= 1 iff idx matches). Data encoded as
+data-dependent CNOT fan-out from each leaf. After fan-out, AND tree is reversed.
+
+**Claimed cost: 4L-4 T gates (= 2(L-1) Toffoli), O(log L) ancillae, W-independent.**
+
+### Implementation — `src/qrom.jl`
+
+```julia
+emit_qrom!(gates, wa, data::Vector{UInt64}, idx_wires, W::Int) -> Vector{Int}
+```
+
+Emits `(idx, 0^W) → (idx, data[idx])` inline. Recursive DFS of the binary tree:
+at each internal node allocates two child flags (`right = parent AND idx_bit` via
+1 Toffoli, `left = parent XOR right` via 2 CNOTs), recurses, uncomputes both,
+returns flag wires to the WireAllocator pool. O(log L) peak ancilla wire use.
+
+Data is baked inline — `data::Vector{UInt64}` must be compile-time constant at
+call site. At each leaf ℓ, loops data[ℓ+1]'s bits; emits `CNOT(leaf_flag, data_out[bit])`
+for each set bit. Zero bits cost zero gates.
+
+### Measured scaling (post-Bennett; self-uncomputing → 2× over raw paper bound)
+
+```
+L  | gates | Toffoli | wires
+---+-------+---------+------
+ 4 |   56  |   12    |  23
+ 8 |  120  |   28    |  26
+16 |  256  |   60    |  29
+32 |  544  |  124    |  32
+```
+
+Post-Bennett Toffoli = **4(L-1) exactly** (paper's 2(L-1) × 2 for Bennett reverse).
+Wire count grows as ~W + log L (DFS flag reuse via `free!`).
+
+### W-independence (L=4, varying W)
+
+```
+W  | gates | Toffoli
+---+-------+--------
+ 4 |  52   |  12
+ 8 |  56   |  12
+16 |  72   |  12
+32 | 104   |  12
+64 | 168   |  12
+```
+
+Toffoli count stays at 12 regardless of W — CNOTs scale with data popcount × W in
+the worst case, never Toffolis. Matches paper's claim exactly.
+
+### Head-to-head vs soft_mux_load (existing T1b path)
+
+| L | Primitive              | Gates  | Reduction |
+|---|------------------------|--------|-----------|
+| 4 | soft_mux_load_4x8      | 7,514  | —         |
+| 4 | QROM (W=8)             |    56  | **134×**  |
+| 8 | soft_mux_load_8x8      | 9,590  | —         |
+| 8 | QROM (W=8)             |   144  | **66.6×** |
+
+For read-only constant tables, QROM is 2 orders of magnitude smaller than
+our MUX-tree fallback. The gap widens at larger W (MUX is O(L·W), QROM is
+O(L + W·popcount)).
+
+### Known sub-optimality (MVP)
+
+QROM's forward circuit is already self-uncomputing (paper § III.C), so Bennett's
+reverse phase doubles it redundantly — same architectural issue as Cuccaro
+(Bennett-07r). Fixing would halve the gate count on every QROM-dispatched lookup.
+
+### Restrictions (MVP)
+
+- `L` must be a power of two (follow-up: non-power-of-two via subtree truncation,
+  paper Fig 3's "highlighted runs" elimination)
+- `W` ≤ 64
+- Data is `Vector{UInt64}` — caller must ensure `(d & ~mask) == 0` for W<64
+
+### Test
+
+`test/test_qrom.jl` — 69 assertions covering L∈{2,4,8,16}, W∈{8,16,32}, edge
+data (all-zero, all-ones, alternating), exact Toffoli-count match to 2(L-1)
+pre-Bennett, and CNOT fan-out scaling with popcount. Hooked into runtests.jl.
+
+### What this unblocks
+
+- T1c.2 (Bennett-za54): `lower_var_gep!` dispatch to QROM when base is a
+  compile-time-constant array.
+- T1c.3 (Bennett-qw8k): scaling benchmark QROM vs MUX tree vs MUX EXCH for L∈{4..128}.
