@@ -129,6 +129,10 @@ function _module_to_parsed_ir(mod::LLVM.Module)
     end
     func === nothing && error("No julia_ function found in LLVM module")
 
+    # T1c.2: extract compile-time-constant global arrays so lower_var_gep! can
+    # dispatch read-only lookups through QROM instead of a MUX-tree.
+    globals = _extract_const_globals(mod)
+
     # Return type (scalar integer or array of integers)
     ft = LLVM.function_type(func)
     rt = LLVM.return_type(ft)
@@ -206,7 +210,51 @@ function _module_to_parsed_ir(mod::LLVM.Module)
     # Post-pass: expand switch terminators into cascaded icmp + branch blocks
     blocks = _expand_switches(blocks)
 
-    return ParsedIR(ret_width, args, blocks, ret_elem_widths)
+    return ParsedIR(ret_width, args, blocks, ret_elem_widths, globals)
+end
+
+"""
+Extract constant-initialized integer-array globals from `mod`.
+
+Returns a dict keyed by global name (Symbol) mapping to `(data, elem_width)` where
+`data` is the array contents zero-extended into UInt64 (one entry per element) and
+`elem_width` is the per-element bit width from the LLVM type.
+
+Skips non-constant globals, globals without a ConstantDataArray initializer,
+non-integer element types, and elements wider than 64 bits.
+"""
+function _extract_const_globals(mod::LLVM.Module)
+    out = Dict{Symbol, Tuple{Vector{UInt64}, Int}}()
+    for g in LLVM.globals(mod)
+        # Julia emits various globals (type references, aliases, dispatch tables)
+        # whose initializers we can't meaningfully materialize. Guard with a
+        # try/catch because LLVM.initializer errors for unknown value kinds
+        # (e.g. GlobalAlias).
+        LLVM.isconstant(g) || continue
+        init = try
+            LLVM.initializer(g)
+        catch
+            nothing
+        end
+        init === nothing && continue
+        init isa LLVM.ConstantDataArray || continue
+        ty = LLVM.value_type(init)
+        ty isa LLVM.ArrayType || continue
+        elem_ty = LLVM.eltype(ty)
+        elem_ty isa LLVM.IntegerType || continue
+        elem_width = LLVM.width(elem_ty)
+        1 <= elem_width <= 64 || continue
+        n = Int(LLVM.API.LLVMGetArrayLength(ty.ref))
+        data = Vector{UInt64}(undef, n)
+        for i in 0:(n-1)
+            elt_ref = LLVM.API.LLVMGetElementAsConstant(init.ref, i)
+            elt = LLVM.Value(elt_ref)
+            data[i+1] = elt isa LLVM.ConstantInt ?
+                UInt64(LLVM.API.LLVMConstIntGetZExtValue(elt.ref)) : UInt64(0)
+        end
+        out[Symbol(LLVM.name(g))] = (data, elem_width)
+    end
+    return out
 end
 
 """
@@ -721,6 +769,7 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
     if opc == LLVM.API.LLVMGetElementPtr
         ops = LLVM.operands(inst)
         base = ops[1]
+        # Case A: base is a local SSA value that we've already named
         if haskey(names, base.ref) && length(ops) == 2
             if ops[2] isa LLVM.ConstantInt
                 # Constant-index GEP → IRPtrOffset (wire selection from flat array)
@@ -733,6 +782,24 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
                 src_type = LLVM.LLVMType(src_ty_ref)
                 ew = src_type isa LLVM.IntegerType ? LLVM.width(src_type) : 8
                 return IRVarGEP(dest, ssa(names[base.ref]), idx_op, ew)
+            end
+        end
+        # Case B: base is a global constant (T1c.2). Emit IRVarGEP carrying the
+        # global's LLVM name as the base symbol; lower_var_gep! looks this up
+        # in parsed.globals and dispatches to QROM.
+        if base isa LLVM.GlobalVariable && LLVM.isconstant(base) && length(ops) == 2
+            gname = Symbol(LLVM.name(base))
+            src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(inst)
+            src_type = LLVM.LLVMType(src_ty_ref)
+            ew = src_type isa LLVM.IntegerType ? LLVM.width(src_type) : 8
+            if ops[2] isa LLVM.ConstantInt
+                # Compile-time index into a constant table — still synthesizable
+                # as IRVarGEP with a constant-kind index.
+                offset = convert(Int, ops[2])
+                return IRVarGEP(dest, ssa(gname), iconst(offset), ew)
+            else
+                idx_op = _operand(ops[2], names)
+                return IRVarGEP(dest, ssa(gname), idx_op, ew)
             end
         end
         return nothing  # GEP with unknown base — skip

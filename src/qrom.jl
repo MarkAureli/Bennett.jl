@@ -129,3 +129,49 @@ function _qrom_tree!(gates::Vector{ReversibleGate}, wa::WireAllocator,
     free!(wa, [left_flag, right_flag])
     return
 end
+
+"""
+Dispatch helper invoked by `lower_var_gep!` when the base pointer is a
+compile-time-constant global (T1c.2). Resolves the GEP's index operand and
+either short-circuits to a constant-output materialization (`idx` is a compile-
+time constant) or emits a QROM circuit (`idx` is SSA).
+
+`data` is the raw constant-table contents extracted from the LLVM global.
+`idx_op` is the GEP's index operand (`:ssa` or `:const`). `W` is the element bit
+width. Returns the W output wires holding `data[idx]`.
+"""
+function _emit_qrom_from_gep!(gates::Vector{ReversibleGate}, wa::WireAllocator,
+                              vw::Dict{Symbol,Vector{Int}},
+                              data::Vector{UInt64}, idx_op::IROperand, W::Int)
+    L = length(data)
+    L >= 1 || error("_emit_qrom_from_gep!: empty const table")
+
+    # Case 1 — compile-time-constant index: materialize `data[idx]` directly.
+    # Zero gates for the lookup itself (just NOTs to set the output bits);
+    # no QROM tree needed. Out-of-range index returns zero (zero-padded semantics).
+    if idx_op.kind == :const
+        word = (0 <= idx_op.value < L) ? data[idx_op.value + 1] : UInt64(0)
+        out = allocate!(wa, W)
+        for bit in 0:W-1
+            if (word >> bit) & 1 == 1
+                push!(gates, NOTGate(out[bit + 1]))
+            end
+        end
+        return out
+    end
+
+    # Case 2 — runtime index via SSA: dispatch to the unary-iteration QROM.
+    # Pad `data` to the next power of two if necessary (padded entries return
+    # zero — safe under Julia's standard pre-GEP boundscheck).
+    n = L == 1 ? 0 : ceil(Int, log2(L))
+    Lp = 1 << n
+    data_padded = L == Lp ? data : vcat(data, fill(UInt64(0), Lp - L))
+
+    idx_full = resolve!(gates, wa, vw, idx_op, 0)
+    length(idx_full) >= n ||
+        error("QROM dispatch: index operand has $(length(idx_full)) bits but " *
+              "L=$L requires $n. This indicates an LLVM IR shape we don't yet handle " *
+              "— file a bug.")
+    idx_wires = n == 0 ? Int[] : idx_full[1:n]
+    return emit_qrom!(gates, wa, data_padded, idx_wires, W)
+end

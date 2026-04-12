@@ -52,6 +52,8 @@ struct LoweringCtx
     alloca_info::Dict{Symbol, Tuple{Int,Int}}                 # alloca dest → (elem_width, n_elems)
     ptr_provenance::Dict{Symbol, Tuple{Symbol,IROperand}}     # ptr SSA → (alloca dest, element idx)
     mux_counter::Ref{Int}                                      # monotonic counter for synthetic SSA names
+    # T1c.2: compile-time-constant global arrays (for QROM dispatch)
+    globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}}          # global name → (data, elem_width)
 end
 
 # Backward-compatible constructor: existing sites don't need to pass the new fields.
@@ -61,7 +63,19 @@ LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
                 block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
                 Dict{Symbol,Tuple{Int,Int}}(),
                 Dict{Symbol,Tuple{Symbol,IROperand}}(),
-                Ref(0))
+                Ref(0),
+                Dict{Symbol,Tuple{Vector{UInt64},Int}}())
+
+# 12-arg constructor for callers that want to pass globals explicitly.
+LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
+            block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
+            globals::Dict{Symbol,Tuple{Vector{UInt64},Int}}) =
+    LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
+                block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
+                Dict{Symbol,Tuple{Int,Int}}(),
+                Dict{Symbol,Tuple{Symbol,IROperand}}(),
+                Ref(0),
+                globals)
 
 # Dispatched instruction lowering — Julia selects the method by inst type
 _lower_inst!(ctx::LoweringCtx, inst::IRPhi, label::Symbol) =
@@ -87,7 +101,7 @@ _lower_inst!(ctx::LoweringCtx, inst::IRPtrOffset, ::Symbol) =
 
 _lower_inst!(ctx::LoweringCtx, inst::IRVarGEP, ::Symbol) =
     lower_var_gep!(ctx.gates, ctx.wa, ctx.vw, inst; ptr_provenance=ctx.ptr_provenance,
-                   alloca_info=ctx.alloca_info)
+                   alloca_info=ctx.alloca_info, globals=ctx.globals)
 
 _lower_inst!(ctx::LoweringCtx, inst::IRLoad, ::Symbol) =
     lower_load!(ctx, inst)
@@ -335,7 +349,8 @@ function lower(parsed::ParsedIR; max_loop_iterations::Int=0, use_inplace::Bool=t
             end
         else
             lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_order;
-                               block_pred, ssa_liveness, inst_counter, gate_groups, use_karatsuba, compact_calls)
+                               block_pred, ssa_liveness, inst_counter, gate_groups,
+                               use_karatsuba, compact_calls, globals=parsed.globals)
         end
 
         # Process terminator (for non-loop blocks AND after loop unrolling)
@@ -501,9 +516,11 @@ function lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_orde
                            inst_counter::Ref{Int}=Ref(0),
                            gate_groups::Vector{GateGroup}=GateGroup[],
                            use_karatsuba::Bool=false,
-                           compact_calls::Bool=false)
+                           compact_calls::Bool=false,
+                           globals::Dict{Symbol,Tuple{Vector{UInt64},Int}}=Dict{Symbol,Tuple{Vector{UInt64},Int}}())
     ctx = LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
-                      block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls)
+                      block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
+                      globals)
     for inst in block.instructions
         inst_counter[] += 1
         _ws = wa.next_wire
@@ -1345,11 +1362,25 @@ Variable-index GEP: MUX-tree selecting one element by runtime index.
 The base pointer's wires are a flattened array of N elements of W bits each.
 The index selects which W-bit element to produce, via a binary MUX tree
 with ceil(log2(N)) levels.
+
+T1c.2: when the base is a compile-time-constant global (present in `globals`),
+dispatch to QROM (Babbush-Gidney unary iteration) instead — O(L) Toffolis and
+W-independent, vs MUX's O(L·W). See `emit_qrom!`.
 """
 function lower_var_gep!(gates::Vector{ReversibleGate}, wa::WireAllocator,
                         vw::Dict{Symbol,Vector{Int}}, inst::IRVarGEP;
                         ptr_provenance::Union{Nothing,Dict{Symbol,Tuple{Symbol,IROperand}}}=nothing,
-                        alloca_info::Union{Nothing,Dict{Symbol,Tuple{Int,Int}}}=nothing)
+                        alloca_info::Union{Nothing,Dict{Symbol,Tuple{Int,Int}}}=nothing,
+                        globals::Union{Nothing,Dict{Symbol,Tuple{Vector{UInt64},Int}}}=nothing)
+    # T1c.2: constant global table → QROM
+    if globals !== nothing && haskey(globals, inst.base.name)
+        data, gw = globals[inst.base.name]
+        gw == inst.elem_width ||
+            error("VarGEP elem_width=$(inst.elem_width) disagrees with global $(inst.base.name) elem_width=$gw")
+        vw[inst.dest] = _emit_qrom_from_gep!(gates, wa, vw, data, inst.index, inst.elem_width)
+        return
+    end
+
     # T1b.3: if base is an alloca, record provenance so lower_store!/lower_load!
     # can route through soft_mux_* callees instead of the MUX-tree slice.
     if ptr_provenance !== nothing && alloca_info !== nothing &&

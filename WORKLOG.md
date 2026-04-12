@@ -2970,3 +2970,83 @@ pre-Bennett, and CNOT fan-out scaling with popcount. Hooked into runtests.jl.
 - T1c.2 (Bennett-za54): `lower_var_gep!` dispatch to QROM when base is a
   compile-time-constant array.
 - T1c.3 (Bennett-qw8k): scaling benchmark QROM vs MUX tree vs MUX EXCH for L∈{4..128}.
+
+## 2026-04-12 — T1c.2: reversible_compile dispatches const tables to QROM (Bennett-za54)
+
+### End-to-end integration
+
+Plain Julia code like `f(x) = let tbl = (a,b,c,d); tbl[(x&3)+1]; end` now compiles
+straight to a QROM-backed reversible circuit. No special annotations, no soft_mux
+helpers, no hand-lifted tables — just write the function. Julia's compiler lowers
+the tuple to a private constant global (`@"_j_const#1" = private constant [4 x i8] c"..."`);
+our extractor pulls the data into `ParsedIR.globals`; our lower_var_gep! dispatch
+routes it through `emit_qrom!`.
+
+### Measured end-to-end gate counts (via `reversible_compile`)
+
+| Julia function                       | L  | Total gates | Toffoli | Wires |
+|--------------------------------------|----|-------------|---------|-------|
+| 4-byte S-box prefix lookup           |  4 |         144 |      28 |   114 |
+| 8-byte S-box prefix lookup           |  8 |         234 |      44 |   114 |
+| 16-byte AES S-box prefix lookup      | 16 |         402 |      76 |   114 |
+
+Compare to the MUX-tree path that existed before T1c.2 (`soft_mux_load_NxW`):
+L=4 MUX was ≈7,500 gates; L=8 MUX was ≈9,600 gates. **QROM dispatch is 52×–66×
+smaller** on these end-to-end Julia lookups.
+
+Wire count stays ~constant at 114 because the Julia source is the same wrapper
+(UInt8 arg, UInt8 return) — only the internal table-size changes, and QROM's
+log L flag ancillae are negligible.
+
+### Implementation
+
+Four-step integration, all under red-green TDD (9 new tests in
+`test/test_qrom_dispatch.jl`, 774 assertions):
+
+1. **`ParsedIR` gains `globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}}`** —
+   extracted from LLVM.Module globals at parse time. Keyed by the global's
+   LLVM name (e.g. `Symbol("_j_const#1")`), valued as `(data, elem_width)`.
+
+2. **`ir_extract.jl` extracts const-initialized integer-array globals** —
+   new `_extract_const_globals(mod)` walks `LLVM.globals(mod)`, filters to
+   `isconstant` globals with `ConstantDataArray` initializers over
+   `IntegerType`, reads each element via `LLVMGetElementAsConstant` +
+   `LLVMConstIntGetZExtValue`. Julia emits many non-table globals (type
+   references, aliases, dispatch tables) whose `LLVM.initializer` errors
+   with "Unknown value kind" — guarded with try/catch.
+
+3. **GEP extractor recognizes `LLVM.GlobalVariable` bases** — previously
+   `if haskey(names, base.ref) && length(ops) == 2` skipped global-backed
+   GEPs. Added a Case B branch: when `base isa LLVM.GlobalVariable && LLVM.isconstant(base)`,
+   emit `IRVarGEP(dest, ssa(gname), idx_op, elem_width)`. The subsequent IRLoad's
+   pointer SSA aliases to these wires (existing alias-slice path).
+
+4. **`lower_var_gep!` dispatches to `_emit_qrom_from_gep!`** — when
+   `inst.base.name` is in `ctx.globals`, pulls the data vector and elem_width,
+   resolves the idx operand, and calls `emit_qrom!`. Static idx (compile-time
+   constant) short-circuits to zero-gate constant materialization.
+   `LoweringCtx` extended with `globals` field; threaded through `lower()` and
+   `lower_block_insts!` via backward-compatible constructors.
+
+### Julia codegen gotcha
+
+**Module-level tuples don't inline.** `const sbox = (...)` at module scope
+produces a by-reference `Any` lookup inside the function (`call @ijl_undefined_var_error`
+or pointer-arg), not a private constant global. Work around with `let sbox = (...); body; end`
+inside the function body — this forces Julia to emit the tuple as an inline
+compile-time constant. Documented in `test/test_qrom_dispatch.jl`.
+
+### MVP restrictions
+
+- Global data widths in 1..64 bits (matches QROM's UInt64 data word)
+- Single-index GEPs only (`getelementptr TYPE, ptr @g, i64 %idx`) — multi-index
+  GEPs like `getelementptr [N x T], ptr @g, i64 0, i64 %idx` not yet plumbed
+- Non-power-of-two table lengths zero-pad to next 2^n (correct under Julia's
+  standard pre-GEP boundscheck, which ensures idx ∈ [0, L))
+
+### What this unblocks
+
+- T1c.3 (Bennett-qw8k): direct comparison benchmark QROM vs MUX EXCH for L∈{4..128},
+  all metrics (gate count, Toffoli, T-count, wires) side by side.
+- Real lookup-heavy benchmarks: AES S-box, bit-reversal tables, trig tables for
+  soft-float, all compile through the same pipeline.

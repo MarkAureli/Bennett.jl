@@ -148,18 +148,31 @@ struct ParsedIR
     args::Vector{Tuple{Symbol, Int}}
     blocks::Vector{IRBasicBlock}
     ret_elem_widths::Vector{Int}   # [8] for i8, [8,8] for [2 x i8]
+    # T1c.2 globals: compile-time-constant arrays. Maps global name (as extracted
+    # from LLVM, e.g. `_j_const#1`) to (data_words, elem_width). `data_words[i+1]`
+    # is the i-th element of the array, zero-extended into UInt64. Used by
+    # lower_var_gep! to dispatch to QROM when the GEP base is a global constant.
+    globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}}
     _instructions_cache::Vector{IRInst}  # cached flattened instructions for backward compat
+end
+
+# Constructor without cache or globals (auto-computes, empty globals)
+function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
+                  blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int})
+    ParsedIR(ret_width, args, blocks, ret_elem_widths,
+             Dict{Symbol, Tuple{Vector{UInt64}, Int}}())
 end
 
 # Constructor without cache (auto-computes)
 function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
-                  blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int})
+                  blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int},
+                  globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}})
     insts = IRInst[]
     for block in blocks
         append!(insts, block.instructions)
         push!(insts, block.terminator)
     end
-    ParsedIR(ret_width, args, blocks, ret_elem_widths, insts)
+    ParsedIR(ret_width, args, blocks, ret_elem_widths, globals, insts)
 end
 
 # Backward compat: parsed.instructions returns cached flattened list
@@ -171,4 +184,4 @@ function Base.getproperty(p::ParsedIR, name::Symbol)
     end
 end
 
-Base.propertynames(::ParsedIR) = (:ret_width, :args, :blocks, :instructions, :ret_elem_widths)
+Base.propertynames(::ParsedIR) = (:ret_width, :args, :blocks, :instructions, :ret_elem_widths, :globals)
