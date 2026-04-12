@@ -22,6 +22,7 @@ include("divider.jl")
 include("softfloat/softfloat.jl")
 include("softmem.jl")
 include("qrom.jl")
+include("memssa.jl")
 
 export reversible_compile, simulate, extract_ir, parse_ir, extract_parsed_ir, register_callee!
 export soft_fadd, soft_fsub, soft_fmul, soft_fdiv, soft_fneg, soft_fcmp_olt, soft_fcmp_oeq, soft_fcmp_ole, soft_fcmp_une, soft_fptosi, soft_sitofp

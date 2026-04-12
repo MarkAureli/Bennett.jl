@@ -153,26 +153,38 @@ struct ParsedIR
     # is the i-th element of the array, zero-extended into UInt64. Used by
     # lower_var_gep! to dispatch to QROM when the GEP base is a global constant.
     globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}}
+    # T2a.2 memssa: parsed MemorySSA annotations (nothing unless
+    # extract_parsed_ir was called with use_memory_ssa=true). Forward-declared
+    # as Any to avoid circular type dependency with src/memssa.jl.
+    memssa::Any
     _instructions_cache::Vector{IRInst}  # cached flattened instructions for backward compat
 end
 
-# Constructor without cache or globals (auto-computes, empty globals)
+# Constructor without cache or globals (auto-computes, empty globals, no memssa)
 function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
                   blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int})
     ParsedIR(ret_width, args, blocks, ret_elem_widths,
-             Dict{Symbol, Tuple{Vector{UInt64}, Int}}())
+             Dict{Symbol, Tuple{Vector{UInt64}, Int}}(), nothing)
 end
 
-# Constructor without cache (auto-computes)
+# Constructor with globals but no memssa
 function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
                   blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int},
                   globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}})
+    ParsedIR(ret_width, args, blocks, ret_elem_widths, globals, nothing)
+end
+
+# Full constructor (auto-computes instructions cache)
+function ParsedIR(ret_width::Int, args::Vector{Tuple{Symbol, Int}},
+                  blocks::Vector{IRBasicBlock}, ret_elem_widths::Vector{Int},
+                  globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}},
+                  memssa)
     insts = IRInst[]
     for block in blocks
         append!(insts, block.instructions)
         push!(insts, block.terminator)
     end
-    ParsedIR(ret_width, args, blocks, ret_elem_widths, globals, insts)
+    ParsedIR(ret_width, args, blocks, ret_elem_widths, globals, memssa, insts)
 end
 
 # Backward compat: parsed.instructions returns cached flattened list
@@ -184,4 +196,5 @@ function Base.getproperty(p::ParsedIR, name::Symbol)
     end
 end
 
-Base.propertynames(::ParsedIR) = (:ret_width, :args, :blocks, :instructions, :ret_elem_widths, :globals)
+Base.propertynames(::ParsedIR) = (:ret_width, :args, :blocks, :instructions,
+                                   :ret_elem_widths, :globals, :memssa)

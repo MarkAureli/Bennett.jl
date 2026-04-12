@@ -3130,3 +3130,97 @@ surface immediately.
   Toffolis post-Bennett vs the MUX tree's ≈ 60k. Order-of-magnitude headline.
 - **Soft-float trig/log tables** — currently not implemented; would become
   feasible with QROM as the backing primitive.
+
+## 2026-04-12 — T2a.1+T2a.2: MemorySSA investigation + ingest (Bennett-law3, Bennett-81bs)
+
+### Investigation conclusion
+
+**GO via printer-pass-output parsing.** `docs/memory/memssa_investigation.md`
+documents the trade space: LLVM.jl 9.4.6 exposes MemorySSA only through
+pipeline passes (`print<memoryssa>`, `verify<memoryssa>`), not as a queryable
+C-API object. But we CAN run the printer and capture its stderr output via a
+Julia `Pipe`, then parse the annotation comments — the output is stable LLVM
+textual IR format (`; N = MemoryDef(M)`, `; MemoryUse(N)`, `; N = MemoryPhi(...)`).
+
+Rejected alternatives: direct ccall (portability), custom C++ pass (build infra
+in a pure-Julia package), full reimplementation (2500 LOC of LLVM analysis).
+
+### Implementation — `src/memssa.jl`
+
+```julia
+struct MemSSAInfo
+    def_at_line::Dict{Int, Int}              # line → Def id
+    def_clobber::Dict{Int, Union{Int, Symbol}}  # Def → clobbered (Int or :live_on_entry)
+    use_at_line::Dict{Int, Int}              # line → Def the use reads from
+    phis::Dict{Int, Vector{Tuple{Symbol, Int}}}  # Phi id → [(block, incoming_id), …]
+    annotated_ir::String
+end
+
+run_memssa(f, arg_types; preprocess=true) -> MemSSAInfo
+parse_memssa_annotations(txt) -> MemSSAInfo  # standalone parser (testable)
+```
+
+Parser uses regex on annotation lines:
+  - `_RE_MEM_DEF` → `"; (\d+) = MemoryDef((\d+|liveOnEntry))"`
+  - `_RE_MEM_USE` → `"; MemoryUse((\d+|liveOnEntry))"`
+  - `_RE_MEM_PHI` → `"; (\d+) = MemoryPhi(...)"` with nested `{bb,id}` splits
+
+Annotations precede their instruction — track as pending, attach to next
+non-annotation line. Blank lines left pending (LLVM sometimes inserts them).
+
+### Integration — `extract_parsed_ir`
+
+New kwarg `use_memory_ssa::Bool=false`. When true:
+1. Run MemorySSA printer pass on the raw (possibly preprocessed) IR, capture
+   output via `redirect_stderr` → `Pipe`.
+2. Parse the capture into `MemSSAInfo`.
+3. Stamp onto `ParsedIR.memssa` alongside the existing walked IR.
+
+Backward-compat: `parsed.memssa === nothing` when the kwarg is false. No existing
+call sites affected.
+
+### ParsedIR extension
+
+Added `memssa::Any` field (typed Any to avoid circular dep with `src/memssa.jl`
+which imports `ParsedIR`). Three constructor overloads preserve every existing
+call site.
+
+### Capture mechanism — cache the gotcha
+
+```julia
+pipe = Pipe()
+LLVM.Context() do _ctx
+    mod = parse(LLVM.Module, ir_string)
+    Base.redirect_stderr(pipe) do
+        @dispose pb = LLVM.NewPMPassBuilder() begin
+            LLVM.add!(pb, "print<memoryssa>")
+            LLVM.run!(pb, mod)
+        end
+    end
+end
+close(pipe.in)
+annotated = read(pipe, String)
+```
+
+- `IOBuffer` does NOT work with `redirect_stderr`; must use `Pipe`.
+- Must `close(pipe.in)` after the pass runs, before reading. Otherwise `read`
+  blocks.
+- Handles 10KB+ captures without issue.
+
+### What this unblocks
+
+- T2a.3 (Bennett-08wr): integration tests for cases T0 preprocessing misses
+  (conditional stores, aliased pointers, phi-merged memory states).
+- Beyond: once `lower_load!` consults `ctx.memssa.use_at_line` to identify the
+  exact MemoryDef its Use clobbers, we can correctly lower arbitrary memory
+  patterns — not just the MVP "single alloca, linear stores, var-idx load"
+  covered by `ptr_provenance`.
+
+### Test coverage — `test/test_memssa.jl`
+
+15 assertions:
+- Basic Def/Use parse on hand-crafted annotation fragment
+- MemoryPhi parse on diamond-CFG fragment
+- End-to-end `run_memssa(f, arg_types)` on a Julia function with allocas
+- No-op behavior for memory-free functions
+- `use_memory_ssa=true` kwarg round-trip through `extract_parsed_ir`

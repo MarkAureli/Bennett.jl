@@ -41,7 +41,8 @@ Pass-pipeline control:
 function extract_parsed_ir(f, arg_types::Type{<:Tuple};
                            optimize::Bool=true,
                            preprocess::Bool=false,
-                           passes::Union{Nothing,Vector{String}}=nothing)
+                           passes::Union{Nothing,Vector{String}}=nothing,
+                           use_memory_ssa::Bool=false)
     ir_string = sprint(io -> code_llvm(io, f, arg_types; debuginfo=:none, optimize, dump_module=true))
 
     effective_passes = String[]
@@ -52,6 +53,16 @@ function extract_parsed_ir(f, arg_types::Type{<:Tuple};
         append!(effective_passes, passes)
     end
 
+    # T2a.2: capture MemorySSA annotations before the main IR walk. Runs in a
+    # separate context so stderr capture for the printer doesn't collide with
+    # our main extraction.
+    memssa = if use_memory_ssa
+        annotated = _run_memssa_on_ir(ir_string; preprocess=preprocess)
+        parse_memssa_annotations(annotated)
+    else
+        nothing
+    end
+
     local result::ParsedIR
     LLVM.Context() do _ctx
         mod = parse(LLVM.Module, ir_string)
@@ -60,6 +71,11 @@ function extract_parsed_ir(f, arg_types::Type{<:Tuple};
         end
         result = _module_to_parsed_ir(mod)
         dispose(mod)
+    end
+    # Stamp memssa into the result if requested
+    if memssa !== nothing
+        result = ParsedIR(result.ret_width, result.args, result.blocks,
+                          result.ret_elem_widths, result.globals, memssa)
     end
     return result
 end
