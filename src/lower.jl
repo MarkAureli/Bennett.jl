@@ -1441,14 +1441,47 @@ end
 function _lower_load_via_mux!(ctx::LoweringCtx, inst::IRLoad)
     alloca_dest, idx_op = ctx.ptr_provenance[inst.ptr.name]
     info = ctx.alloca_info[alloca_dest]
-    info == (8, 4) ||
-        error("_lower_load_via_mux!: MVP supports only (elem_width=8, n_elems=4); got $info")
-    inst.width == 8 ||
-        error("_lower_load_via_mux!: MVP supports only 8-bit loads from arrays; got width=$(inst.width)")
+
+    strategy = _pick_alloca_strategy(info, idx_op)
+
+    if strategy == :shadow
+        return _lower_load_via_shadow!(ctx, inst, alloca_dest, info, idx_op)
+    elseif strategy == :mux_exch_4x8
+        return _lower_load_via_mux_4x8!(ctx, inst, alloca_dest, info, idx_op)
+    elseif strategy == :mux_exch_8x8
+        return _lower_load_via_mux_8x8!(ctx, inst, alloca_dest, info, idx_op)
+    else
+        error("_lower_load_via_mux!: unsupported (elem_width=$(info[1]), n_elems=$(info[2])) for dynamic idx")
+    end
+end
+
+# T3b.3 shadow-memory load for static idx: just CNOT-copy the target slot.
+function _lower_load_via_shadow!(ctx::LoweringCtx, inst::IRLoad,
+                                  alloca_dest::Symbol, info::Tuple{Int,Int},
+                                  idx_op::IROperand)
+    elem_w, n = info
+    inst.width == elem_w ||
+        error("_lower_load_via_shadow!: load width=$(inst.width) doesn't match elem_width=$elem_w")
+    0 <= idx_op.value < n ||
+        error("_lower_load_via_shadow!: idx=$(idx_op.value) out of range [0, $n)")
 
     arr_wires = ctx.vw[alloca_dest]
+    length(arr_wires) == elem_w * n ||
+        error("_lower_load_via_shadow!: primal has $(length(arr_wires)) wires, expected $(elem_w*n)")
+
+    primal_slot = arr_wires[idx_op.value * elem_w + 1 : (idx_op.value + 1) * elem_w]
+    ctx.vw[inst.dest] = emit_shadow_load!(ctx.gates, ctx.wa, primal_slot, elem_w)
+    return nothing
+end
+
+function _lower_load_via_mux_4x8!(ctx::LoweringCtx, inst::IRLoad,
+                                   alloca_dest::Symbol, info::Tuple{Int,Int},
+                                   idx_op::IROperand)
+    inst.width == 8 ||
+        error("_lower_load_via_mux_4x8!: load width must be 8, got $(inst.width)")
+    arr_wires = ctx.vw[alloca_dest]
     length(arr_wires) == 32 ||
-        error("_lower_load_via_mux!: expected 32-wire packed array at alloca $alloca_dest; got $(length(arr_wires))")
+        error("_lower_load_via_mux_4x8!: expected 32-wire packed array at alloca $alloca_dest; got $(length(arr_wires))")
 
     tag = _next_mux_tag!(ctx, "ld", inst.dest)
     arr_sym = Symbol("__mux_load_arr_", tag)
@@ -1459,6 +1492,31 @@ function _lower_load_via_mux!(ctx::LoweringCtx, inst::IRLoad)
     ctx.vw[idx_sym] = _operand_to_u64!(ctx, idx_op)
 
     call = IRCall(tmp_sym, soft_mux_load_4x8,
+                  [ssa(arr_sym), ssa(idx_sym)], [64, 64], 64)
+    lower_call!(ctx.gates, ctx.wa, ctx.vw, call; compact=ctx.compact_calls)
+
+    ctx.vw[inst.dest] = ctx.vw[tmp_sym][1:8]
+    return nothing
+end
+
+function _lower_load_via_mux_8x8!(ctx::LoweringCtx, inst::IRLoad,
+                                   alloca_dest::Symbol, info::Tuple{Int,Int},
+                                   idx_op::IROperand)
+    inst.width == 8 ||
+        error("_lower_load_via_mux_8x8!: load width must be 8, got $(inst.width)")
+    arr_wires = ctx.vw[alloca_dest]
+    length(arr_wires) == 64 ||
+        error("_lower_load_via_mux_8x8!: expected 64-wire packed array at alloca $alloca_dest")
+
+    tag = _next_mux_tag!(ctx, "ld", inst.dest)
+    arr_sym = Symbol("__mux_load_arr_", tag)
+    idx_sym = Symbol("__mux_load_idx_", tag)
+    tmp_sym = Symbol("__mux_load_u64_", tag)
+
+    ctx.vw[arr_sym] = _wires_to_u64!(ctx, arr_wires)
+    ctx.vw[idx_sym] = _operand_to_u64!(ctx, idx_op)
+
+    call = IRCall(tmp_sym, soft_mux_load_8x8,
                   [ssa(arr_sym), ssa(idx_sym)], [64, 64], 64)
     lower_call!(ctx.gates, ctx.wa, ctx.vw, call; compact=ctx.compact_calls)
 
@@ -1619,18 +1677,49 @@ loudly; T1b.5 adds wider shapes.
 """
 function lower_alloca!(ctx::LoweringCtx, inst::IRAlloca)
     inst.n_elems.kind == :const ||
-        error("lower_alloca!: dynamic n_elems not supported in MVP (%$(inst.n_elems.name))")
+        error("lower_alloca!: dynamic n_elems not supported (%$(inst.n_elems.name)); " *
+              "T3b.3 shadow memory handles static-sized allocas only.")
     n = inst.n_elems.value
-    (inst.elem_width == 8 && n == 4) ||
-        error("lower_alloca!: MVP supports only (elem_width=8, n_elems=4); got ($(inst.elem_width), $n)")
+    n >= 1 || error("lower_alloca!: non-positive n_elems=$n")
+    inst.elem_width >= 1 || error("lower_alloca!: non-positive elem_width=$(inst.elem_width)")
 
-    total_bits = inst.elem_width * n           # 32
+    total_bits = inst.elem_width * n
     wires = allocate!(ctx.wa, total_bits)       # zero by invariant
     ctx.vw[inst.dest] = wires
     ctx.alloca_info[inst.dest] = (inst.elem_width, n)
-    # Self-provenance: a direct store/load on %alloca_dest targets slot 0.
     ctx.ptr_provenance[inst.dest] = (inst.dest, iconst(0))
     return nothing
+end
+
+"""
+    _pick_alloca_strategy(shape::Tuple{Int,Int}, idx::IROperand) -> Symbol
+
+T3b.3 universal dispatcher: select the cheapest correct lowering for a
+store/load into an alloca-backed region, given the (elem_width, n_elems)
+shape and the runtime index operand.
+
+Strategies:
+  :shadow          — static idx (const), any shape. Cheap direct CNOT pattern.
+  :mux_exch_4x8    — dynamic idx on (W=8, N=4) shape.
+  :mux_exch_8x8    — dynamic idx on (W=8, N=8) shape.
+  :unsupported     — dynamic idx on any other shape; caller must error.
+
+Priority rule: static idx ALWAYS dispatches to :shadow. MUX EXCH only
+engages when idx is dynamic and the shape matches a soft_mux_load_NxW
+callee we've already registered.
+"""
+function _pick_alloca_strategy(shape::Tuple{Int,Int}, idx::IROperand)
+    if idx.kind == :const
+        return :shadow
+    end
+    (elem_w, n) = shape
+    if elem_w == 8 && n == 4
+        return :mux_exch_4x8
+    elseif elem_w == 8 && n == 8
+        return :mux_exch_8x8
+    else
+        return :unsupported
+    end
 end
 
 """
@@ -1647,8 +1736,6 @@ be 8. All other cases error loudly.
 function lower_store!(ctx::LoweringCtx, inst::IRStore)
     inst.ptr.kind == :ssa ||
         error("lower_store!: store to a constant pointer is not supported")
-    inst.width == 8 ||
-        error("lower_store!: MVP supports only width=8; got $(inst.width)")
 
     haskey(ctx.ptr_provenance, inst.ptr.name) ||
         error("lower_store!: no provenance for ptr %$(inst.ptr.name); " *
@@ -1657,12 +1744,50 @@ function lower_store!(ctx::LoweringCtx, inst::IRStore)
     info = get(ctx.alloca_info, alloca_dest, nothing)
     info === nothing &&
         error("lower_store!: provenance points to unknown alloca %$alloca_dest")
-    info == (8, 4) ||
-        error("lower_store!: MVP supports only (elem_width=8, n_elems=4); got $info at %$alloca_dest")
+
+    strategy = _pick_alloca_strategy(info, idx_op)
+
+    if strategy == :shadow
+        _lower_store_via_shadow!(ctx, inst, alloca_dest, info, idx_op)
+    elseif strategy == :mux_exch_4x8
+        _lower_store_via_mux_4x8!(ctx, inst, alloca_dest, idx_op)
+    elseif strategy == :mux_exch_8x8
+        _lower_store_via_mux_8x8!(ctx, inst, alloca_dest, idx_op)
+    else
+        error("lower_store!: unsupported (elem_width=$(info[1]), n_elems=$(info[2])) for dynamic idx")
+    end
+    return nothing
+end
+
+# T3b.3 shadow-memory store: idx is compile-time constant, so we touch only
+# the W wires of the target slot directly. Zero Toffoli, 3W CNOT per store.
+function _lower_store_via_shadow!(ctx::LoweringCtx, inst::IRStore,
+                                  alloca_dest::Symbol, info::Tuple{Int,Int},
+                                  idx_op::IROperand)
+    elem_w, n = info
+    inst.width == elem_w ||
+        error("_lower_store_via_shadow!: store width=$(inst.width) doesn't match alloca elem_width=$elem_w")
+    0 <= idx_op.value < n ||
+        error("_lower_store_via_shadow!: idx=$(idx_op.value) out of range [0, $n)")
 
     arr_wires = ctx.vw[alloca_dest]
+    length(arr_wires) == elem_w * n ||
+        error("_lower_store_via_shadow!: primal has $(length(arr_wires)) wires, expected $(elem_w*n)")
+
+    primal_slot = arr_wires[idx_op.value * elem_w + 1 : (idx_op.value + 1) * elem_w]
+    tape = allocate!(ctx.wa, elem_w)
+    val_wires = resolve!(ctx.gates, ctx.wa, ctx.vw, inst.val, elem_w)
+    emit_shadow_store!(ctx.gates, ctx.wa, primal_slot, tape, val_wires, elem_w)
+    return nothing
+end
+
+function _lower_store_via_mux_4x8!(ctx::LoweringCtx, inst::IRStore,
+                                   alloca_dest::Symbol, idx_op::IROperand)
+    inst.width == 8 ||
+        error("_lower_store_via_mux_4x8!: store width must be 8, got $(inst.width)")
+    arr_wires = ctx.vw[alloca_dest]
     length(arr_wires) == 32 ||
-        error("lower_store!: expected 32-wire packed array at %$alloca_dest; got $(length(arr_wires))")
+        error("_lower_store_via_mux_4x8!: expected 32-wire packed array")
 
     tag = _next_mux_tag!(ctx, "st", inst.ptr.name)
     arr_sym = Symbol("__mux_store_arr_", tag)
@@ -1675,12 +1800,36 @@ function lower_store!(ctx::LoweringCtx, inst::IRStore)
     ctx.vw[val_sym] = _operand_to_u64!(ctx, inst.val)
 
     call = IRCall(res_sym, soft_mux_store_4x8,
-                  [ssa(arr_sym), ssa(idx_sym), ssa(val_sym)],
-                  [64, 64, 64], 64)
+                  [ssa(arr_sym), ssa(idx_sym), ssa(val_sym)], [64, 64, 64], 64)
     lower_call!(ctx.gates, ctx.wa, ctx.vw, call; compact=ctx.compact_calls)
 
-    # Rebind alloca_dest to the low 32 wires of the callee's result — the new heap version
     ctx.vw[alloca_dest] = ctx.vw[res_sym][1:32]
+    return nothing
+end
+
+function _lower_store_via_mux_8x8!(ctx::LoweringCtx, inst::IRStore,
+                                   alloca_dest::Symbol, idx_op::IROperand)
+    inst.width == 8 ||
+        error("_lower_store_via_mux_8x8!: store width must be 8, got $(inst.width)")
+    arr_wires = ctx.vw[alloca_dest]
+    length(arr_wires) == 64 ||
+        error("_lower_store_via_mux_8x8!: expected 64-wire packed array")
+
+    tag = _next_mux_tag!(ctx, "st", inst.ptr.name)
+    arr_sym = Symbol("__mux_store_arr_", tag)
+    idx_sym = Symbol("__mux_store_idx_", tag)
+    val_sym = Symbol("__mux_store_val_", tag)
+    res_sym = Symbol("__mux_store_res_", tag)
+
+    ctx.vw[arr_sym] = _wires_to_u64!(ctx, arr_wires)
+    ctx.vw[idx_sym] = _operand_to_u64!(ctx, idx_op)
+    ctx.vw[val_sym] = _operand_to_u64!(ctx, inst.val)
+
+    call = IRCall(res_sym, soft_mux_store_8x8,
+                  [ssa(arr_sym), ssa(idx_sym), ssa(val_sym)], [64, 64, 64], 64)
+    lower_call!(ctx.gates, ctx.wa, ctx.vw, call; compact=ctx.compact_calls)
+
+    ctx.vw[alloca_dest] = ctx.vw[res_sym]
     return nothing
 end
 

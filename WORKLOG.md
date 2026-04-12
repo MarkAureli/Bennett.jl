@@ -3459,3 +3459,112 @@ index) where shadow's O(store-count) tape wires become prohibitive.
   right interface (one tape slot per store, pebbleable) but the scheduler
   that PICKS which slots to share is follow-up. Current tests allocate one
   fresh tape slot per store (worst-case wire count, correct behavior).
+
+## 2026-04-12 — T3b.3: universal memory dispatcher (Bennett-10rm)
+
+### Unified strategy table
+
+`src/lower.jl` now has a single dispatch point for every alloca-backed
+store/load:
+
+```julia
+function _pick_alloca_strategy(shape::Tuple{Int,Int}, idx::IROperand)
+    idx.kind == :const && return :shadow          # static idx: direct CNOT
+    shape == (8, 4)    && return :mux_exch_4x8    # dynamic idx, soft_mux_*_4x8
+    shape == (8, 8)    && return :mux_exch_8x8    # dynamic idx, soft_mux_*_8x8
+    return :unsupported                            # dynamic idx, unhandled shape
+end
+```
+
+Priority rule: **static idx always wins** (cheap). MUX EXCH engages only when
+dynamic idx meets a registered callee's shape.
+
+### New dispatch handlers in `lower.jl`
+
+Split the old monolithic `lower_store!` / `_lower_load_via_mux!` into
+strategy-specific internal handlers:
+
+- `_lower_store_via_shadow!` / `_lower_load_via_shadow!` — slice the primal
+  at the constant idx, call `emit_shadow_*!`. 3W CNOT store, W CNOT load.
+- `_lower_store_via_mux_4x8!` / `_lower_load_via_mux_4x8!` — old soft_mux_4x8
+  path factored out.
+- `_lower_store_via_mux_8x8!` / `_lower_load_via_mux_8x8!` — new 8x8 variant
+  (soft_mux_*_8x8 were already registered by T1b.5; previously unreachable
+  through the dispatcher).
+
+### lower_alloca! relaxed
+
+Was: errored on any shape ≠ (8, 4).
+Now: accepts any (elem_width ≥ 1, n_elems ≥ 1) shape. Static-sized only
+(dynamic n_elems still rejected with a helpful message). Downstream dispatch
+picks the strategy when stores/loads actually occur.
+
+Consequence: functions with larger or non-(8,4) allocas no longer reject at
+extract time. Their stores/loads succeed through shadow (static idx) or
+error at the store/load site with "unsupported shape for dynamic idx" (so
+the failure is at the operation that can't be handled, with precise cause).
+
+### Measured end-to-end
+
+Case 1: `Ref{UInt8}` write-then-read (static idx = 0):
+- Shadow dispatcher fires for both store and load.
+- 256-input exhaustive correctness verified.
+
+Case 2: 4-slot alloca with 4 static-idx stores + 1 dynamic-idx load (hand-
+crafted IR):
+- 4 stores → :shadow (3·8 = 24 CNOT each = 96 CNOT total for stores)
+- 1 load → :mux_exch_4x8 (7,514 gates for the load alone)
+- Mixed strategies cooperate: shadow stores mutate `vw[alloca_dest]` in
+  place; MUX EXCH load reads the updated primal state correctly.
+- All 4 idx values return the corresponding stored value.
+
+### Test coverage — `test/test_universal_dispatch.jl`
+
+287 assertions:
+- Ref pattern (pure shadow path): 256-input exhaustive
+- 4-slot alloca mixed shadow+MUX load via hand-crafted IR: 4 idx values
+- QROM regression (T1c.2 still routes globals through QROM, total < 300 gates)
+- Strategy-picker unit tests: :shadow for static idx (any shape),
+  :mux_exch_4x8/_8x8 for matching shapes, :unsupported for everything else
+
+### Legacy test migration
+
+`test/test_lower_store_alloca.jl` previously asserted that non-(8,4) shapes
+errored at alloca time. Post-T3b.3 those shapes succeed; test updated to
+verify successful compilation instead.
+
+### What this closes out
+
+Memory plan critical path:
+- T0.x — preprocessing ✓
+- T1a — IRStore/IRAlloca types + extraction ✓
+- T1b — MUX EXCH (N=4, N=8, W=8) ✓
+- T1c — QROM (Babbush-Gidney) primitive + dispatch + benchmark ✓
+- T2a — MemorySSA investigation + ingest + integration tests ✓
+- T3a — Feistel reversible hash + Okasaki comparison ✓
+- T3b.1 — shadow memory protocol design ✓
+- T3b.2 — shadow memory primitives ✓
+- T3b.3 — universal dispatcher ✓ (this entry)
+
+Remaining open:
+- T0.3 — Julia EscapeAnalysis integration (P2, low-urgency)
+- T0.4 — 20-function corpus benchmark (P2)
+- T2b.1/2 — @linear macro + mechanical reversal (separate workstream, P3)
+- BC.3 — full SHA-256 benchmark (P2)
+- BC.4 — BENCHMARKS.md head-to-head consolidation (P2)
+- Paper work P.1/P.2 — explicitly deferred per user direction
+
+### Performance summary (all memory strategies, W=8 where applicable)
+
+| Strategy      | Applicability                      | Gates per store | Gates per load |
+|---------------|------------------------------------|-----------------|----------------|
+| :shadow       | static idx, any shape              | 3·elem_w CNOT   | elem_w CNOT    |
+| :mux_exch_4x8 | dynamic idx, (8,4)                 | 7,122           | 7,514          |
+| :mux_exch_8x8 | dynamic idx, (8,8)                 | 14,026          | 9,590          |
+| :qrom         | read-only, global const            | —               | ~56-550 (per L)|
+| :feistel-hash | reversible bijective key hash      | 120-960 (per W) | —              |
+
+Shadow is ~300× cheaper per static-idx op than MUX EXCH — and this is now
+the DEFAULT path whenever idx is known at compile time. Real Julia code
+with local array initialization (N static-idx stores + dynamic-idx read)
+now pays only N · 3W CNOT for the writes rather than N · 7k gates.

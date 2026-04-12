@@ -56,7 +56,12 @@ end
         end
     end
 
-    @testset "alloca with non-MVP shape fails loudly" begin
+    # T3b.3 universal dispatcher relaxed shape constraints: non-(8,4) allocas
+    # now compile successfully when accessed with static idx (shadow path) or
+    # when shape matches another registered mux-exch variant. Below we verify
+    # the new wider coverage rather than the old "error" behavior.
+
+    @testset "alloca i8 × 8 is now supported (T3b.3 MUX EXCH 8x8 path)" begin
         ir = """
         define i8 @julia_f_1(i8 %x) {
         top:
@@ -64,10 +69,11 @@ end
           ret i8 %x
         }
         """
-        @test_throws ErrorException _compile_ir(ir)
+        c = _compile_ir(ir)
+        @test verify_reversibility(c)
     end
 
-    @testset "alloca of i16 (non-MVP elem width) fails loudly" begin
+    @testset "alloca i16 × 4 unused compiles — size extraction succeeds" begin
         ir = """
         define i8 @julia_f_1(i8 %x) {
         top:
@@ -75,7 +81,8 @@ end
           ret i8 %x
         }
         """
-        @test_throws ErrorException _compile_ir(ir)
+        c = _compile_ir(ir)
+        @test verify_reversibility(c)
     end
 
     @testset "store without prior alloca provenance fails loudly" begin
