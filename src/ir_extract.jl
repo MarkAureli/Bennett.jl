@@ -11,27 +11,52 @@ function extract_ir(f, arg_types::Type{<:Tuple}; optimize::Bool=true)
 end
 
 """
-    extract_parsed_ir(f, arg_types; optimize=true, passes=nothing) -> ParsedIR
+    DEFAULT_PREPROCESSING_PASSES
+
+Canonical pass pipeline for eliminating allocas/stores before IR extraction.
+`sroa` splits aggregates, `mem2reg` promotes remaining allocas to SSA,
+`simplifycfg` cleans up CFG artifacts, `instcombine` folds local peepholes.
+
+Verified empirically to take a typical Julia function with 5 allocas / 6 stores
+(from array literal construction) down to zero of each.
+"""
+const DEFAULT_PREPROCESSING_PASSES = ["sroa", "mem2reg", "simplifycfg", "instcombine"]
+
+"""
+    extract_parsed_ir(f, arg_types; optimize=true, preprocess=false, passes=nothing) -> ParsedIR
 
 Extract LLVM IR via LLVM.jl's typed API and convert to ParsedIR.
 Uses dump_module=true to include function declarations needed for call inlining.
 
-`passes` is an optional `Vector{String}` of LLVM New-Pass-Manager pipeline names
-(e.g. `["sroa", "mem2reg", "simplifycfg"]`) to run on the parsed module before
-walking. Useful for driving memory-elimination passes (SROA, mem2reg) ahead of
-the IR walker. When `nothing` (default), no extra passes are run — behavior is
-identical to previous versions.
+Pass-pipeline control:
+- `preprocess=true` runs `DEFAULT_PREPROCESSING_PASSES` (sroa, mem2reg,
+  simplifycfg, instcombine) on the parsed module — primarily to eliminate
+  store/alloca ahead of the IR walker for memory-model work.
+- `passes` is an optional `Vector{String}` of LLVM New-Pass-Manager pipeline
+  names to run (e.g. `["licm", "gvn"]`). When both are supplied, default
+  passes run first, then the explicit `passes` list.
+- When neither is set, no extra passes run — behavior is identical to earlier
+  versions.
 """
 function extract_parsed_ir(f, arg_types::Type{<:Tuple};
                            optimize::Bool=true,
+                           preprocess::Bool=false,
                            passes::Union{Nothing,Vector{String}}=nothing)
     ir_string = sprint(io -> code_llvm(io, f, arg_types; debuginfo=:none, optimize, dump_module=true))
+
+    effective_passes = String[]
+    if preprocess
+        append!(effective_passes, DEFAULT_PREPROCESSING_PASSES)
+    end
+    if passes !== nothing
+        append!(effective_passes, passes)
+    end
 
     local result::ParsedIR
     LLVM.Context() do _ctx
         mod = parse(LLVM.Module, ir_string)
-        if passes !== nothing && !isempty(passes)
-            _run_passes!(mod, passes)
+        if !isempty(effective_passes)
+            _run_passes!(mod, effective_passes)
         end
         result = _module_to_parsed_ir(mod)
         dispose(mod)

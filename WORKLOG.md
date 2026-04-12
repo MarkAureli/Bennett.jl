@@ -2435,3 +2435,22 @@ LLVM.jl 9.4.6 on Julia 1.12.3 has these as public API. The old legacy pass manag
 ### Test
 
 `test/test_preprocessing.jl` (new): 263 assertions covering backward compat (`passes=nothing` matches old behavior), custom passes execute without error, empty pass list is a no-op, and `reversible_compile` still passes full 256-input sweep on `x + Int8(3)`.
+
+## 2026-04-12 — Memory plan T0.2: preprocess kwarg + default pass set (Bennett-9jb)
+
+### What was built
+
+- `const DEFAULT_PREPROCESSING_PASSES = ["sroa", "mem2reg", "simplifycfg", "instcombine"]` — the curated set for eliminating alloca/store before IR extraction.
+- `extract_parsed_ir(...; preprocess::Bool=false, passes=nothing)` — when `preprocess=true`, runs the default set. `preprocess` + explicit `passes` compose additively (default first, then explicit).
+
+### Measurement
+
+Tested on `f(x::Int8) = let arr = [x, x+Int8(1)]; arr[1] + arr[2]; end` which produces 5 allocas / 6 stores in raw LLVM IR (`optimize=false`). After `DEFAULT_PREPROCESSING_PASSES`: 0 allocas, 0 stores.
+
+Even running just `"sroa"` alone eliminates all of them for this function; the added passes are cheap insurance. Order matters if loads depend on cross-pass canonicalization, but for our target (eliminate memory ops before IR walking) SROA is the workhorse.
+
+### Gotchas
+
+- `sprint(io -> show(io, mod))` is the way to dump an `LLVM.Module` back to IR text; `string(mod)` doesn't give the IR form.
+- Julia's `code_llvm(..., optimize=false)` still runs some ahead-of-time optimization (Julia codegen emits SSA directly for most simple functions). You need a real allocating expression — like `[x, y]` — to actually observe allocas pre-pass.
+- `preprocess=false` is intentionally the default: backward compat. Users opt in. When T1b wires memory support end-to-end, preprocess=true will become the default in `reversible_compile`.
