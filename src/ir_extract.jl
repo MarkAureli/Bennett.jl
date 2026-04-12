@@ -884,9 +884,39 @@ function _convert_instruction(inst::LLVM.Instruction, names::Dict{_LLVMRef, Symb
         return IRBinOp(dest, :xor, _operand(src, names), iconst(sign_bit), w)
     end
 
-    # skip known-safe no-op instructions
-    if opc in (LLVM.API.LLVMStore, LLVM.API.LLVMAlloca)
-        return nothing
+    # store: `store ty val, ptr p` -> IRStore (no dest — void in LLVM).
+    # Skip when the stored value isn't an integer type (matches IRLoad policy).
+    if opc == LLVM.API.LLVMStore
+        ops = LLVM.operands(inst)
+        val = ops[1]
+        ptr = ops[2]
+        vt = LLVM.value_type(val)
+        vt isa LLVM.IntegerType || return nothing
+        haskey(names, ptr.ref) || return nothing
+        return IRStore(ssa(names[ptr.ref]),
+                       _operand(val, names),
+                       LLVM.width(vt))
+    end
+
+    # alloca: `%dest = alloca ty[, i32 N]` -> IRAlloca. Only integer element
+    # types are lowered; float / aggregate / pointer element types are skipped
+    # (matches IRLoad policy — SoftFloat dispatch maps Float64 to UInt64
+    # before IR extraction, so float allocas are rare in practice).
+    # n_elems is :const if the operand is a ConstantInt, else :ssa (dynamic —
+    # lowering currently rejects :ssa).
+    if opc == LLVM.API.LLVMAlloca
+        elem_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(inst.ref))
+        elem_ty isa LLVM.IntegerType || return nothing
+        elem_w = LLVM.width(elem_ty)
+        ops = LLVM.operands(inst)
+        n_elems_op = if !isempty(ops) && ops[1] isa LLVM.ConstantInt
+            iconst(convert(Int, ops[1]))
+        elseif !isempty(ops) && haskey(names, ops[1].ref)
+            ssa(names[ops[1].ref])
+        else
+            iconst(1)  # scalar alloca with no explicit count
+        end
+        return IRAlloca(dest, elem_w, n_elems_op)
     end
 
     error("Unsupported LLVM opcode: $opc in instruction: $(string(inst))")

@@ -2497,3 +2497,30 @@ Both width fields honor `width > 1 ? W : 1`. `n_elems` is a count, never narrowe
 ### Test
 
 `test/test_ir_memory_types.jl` — 22 assertions covering struct shape, narrow for both i1 and iN, `_ssa_operands` for static/dynamic variants, and backward-compat check on existing IR types.
+
+## 2026-04-12 — Memory plan T1a.2: extract store/alloca instructions (Bennett-dyh)
+
+### What was built
+
+Replaced the silent skip at `ir_extract.jl:888-890` with real extraction:
+- `store ty val, ptr p` → `IRStore(ssa(ptr), operand(val), width)`
+- `alloca ty[, i32 N]` → `IRAlloca(dest, elem_width, n_elems)`
+
+Policy matches existing `IRLoad` at `ir_extract.jl:751`: skip non-integer value/element types (float, aggregate, pointer). This is correct because SoftFloat dispatch converts Float64 to UInt64 at the ABI level before extraction — float allocas in IR are rare and mostly spurious.
+
+### Bugs caught by TDD
+
+1. **Field-order bug**: my first draft passed `(val, ptr)` to the `IRStore` constructor but the struct field order is `(ptr, val, width)`. Caught by the first test asserting `store_inst.ptr.name == :p`.
+2. **`LLVM.sizeof` needs DataLayout**: my first draft tried to compute float element widths via `LLVM.sizeof(elem_ty) * 8`. That errors with "LLVM types are not sized" because sizeof requires a DataLayout context. Simplified to integer-only for now (skip float allocas, matching IRLoad policy).
+
+### Test approach
+
+Used hand-crafted LLVM IR strings rather than Julia codegen to avoid triggering a pre-existing bug in the `insertvalue` handler (which crashes on complex Julia runtime IR with non-integer aggregate types). Hand-crafted IR gives deterministic, minimal test cases — exactly what's needed for unit tests of extraction logic. Filed the `insertvalue` bug as future work; it's unrelated to the memory plan.
+
+### Test
+
+`test/test_store_alloca_extract.jl` — 279 assertions covering: basic alloca+store+load pattern (dest/width/operands correct), alloca with explicit count (`alloca i8, i32 4`), constant-value store, float-alloca skip policy, and full 256-input backward-compat sweep.
+
+### What this unblocks
+
+T1b.3 — `lower_store!` / `lower_alloca!` can now assume IRStore/IRAlloca appear in the ParsedIR stream. The existing silent-skip path is completely gone.
