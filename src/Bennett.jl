@@ -84,6 +84,13 @@ _narrow_inst(inst::IRBranch, W::Int) = inst  # branches don't have widths
 _narrow_inst(inst::IRInsertValue, W::Int) = IRInsertValue(inst.dest, inst.agg, inst.val, inst.index, W, inst.elem_count)
 _narrow_inst(inst::IRExtractValue, W::Int) = IRExtractValue(inst.dest, inst.agg, inst.index, W)
 _narrow_inst(inst::IRCall, W::Int) = inst  # calls handle their own widths
+# IRStore/IRAlloca: preserve i1 widths like the other narrow methods; n_elems
+# is a count, not a bit-width, so it passes through.
+_narrow_inst(inst::IRStore, W::Int) = IRStore(inst.ptr, inst.val,
+                                              inst.width > 1 ? W : 1)
+_narrow_inst(inst::IRAlloca, W::Int) = IRAlloca(inst.dest,
+                                                inst.elem_width > 1 ? W : 1,
+                                                inst.n_elems)
 _narrow_inst(inst::IRInst, W::Int) = inst  # fallback: pass through
 
 # ---- Register soft-float functions for gate-level inlining ----

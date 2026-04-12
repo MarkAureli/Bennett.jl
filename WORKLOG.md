@@ -2454,3 +2454,46 @@ Even running just `"sroa"` alone eliminates all of them for this function; the a
 - `sprint(io -> show(io, mod))` is the way to dump an `LLVM.Module` back to IR text; `string(mod)` doesn't give the IR form.
 - Julia's `code_llvm(..., optimize=false)` still runs some ahead-of-time optimization (Julia codegen emits SSA directly for most simple functions). You need a real allocating expression — like `[x, y]` — to actually observe allocas pre-pass.
 - `preprocess=false` is intentionally the default: backward compat. Users opt in. When T1b wires memory support end-to-end, preprocess=true will become the default in `reversible_compile`.
+
+## 2026-04-12 — Memory plan T1a.1: IRStore / IRAlloca types (Bennett-fvh)
+
+### Design chosen (via 3+1 proposer agents)
+
+Two proposer agents produced independent designs. Adopted Proposer A's design on all four points:
+
+1. **IRStore has no `dest`** — matches `IRBranch`/`IRRet` void-instruction pattern. Every pass that walks values via `hasproperty(inst, :dest)` already handles dest-less instructions correctly. Synthetic dest (Proposer B's choice) would add surface area without benefit.
+2. **IRAlloca `n_elems::IROperand`** — mirrors `IRVarGEP.index`; static-vs-dynamic is a property of the operand kind, not the type. Lowering rejects `:ssa` for now.
+3. **No `memdef_version` hook** — T2a's MemorySSA shape isn't known yet; premature fields constrain future design. ~2 construction sites to retrofit later.
+4. **No `elem_type_kind`** — Bennett operates on bit vectors uniformly; float/int distinction is a usage-site concern.
+
+```julia
+struct IRStore <: IRInst
+    ptr::IROperand
+    val::IROperand
+    width::Int
+end
+
+struct IRAlloca <: IRInst
+    dest::Symbol
+    elem_width::Int
+    n_elems::IROperand
+end
+```
+
+### Narrow methods (i1-preservation guard per Bennett-z9y/wl8)
+
+Both width fields honor `width > 1 ? W : 1`. `n_elems` is a count, never narrowed.
+
+### Dispatch stubs
+
+`_ssa_operands(::IRStore)` returns [ptr, val] (SSA ones); `_ssa_operands(::IRAlloca)` returns [n_elems] if SSA else empty.
+
+### What this unblocks
+
+- T1a.2 (extraction): replace the silent skip at `ir_extract.jl:841-843`.
+- T1b (lowering): `lower_store!` and `lower_alloca!`.
+- Types compose with existing `IRLoad`/`IRPtrOffset`/`IRVarGEP` via the `vw` map — pointers are SSA symbols resolved to wire ranges exactly as before.
+
+### Test
+
+`test/test_ir_memory_types.jl` — 22 assertions covering struct shape, narrow for both i1 and iN, `_ssa_operands` for static/dynamic variants, and backward-compat check on existing IR types.

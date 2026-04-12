@@ -80,6 +80,26 @@ struct IRLoad <: IRInst
     width::Int          # load width in bits
 end
 
+# --- memory writes ---
+# IRStore produces no SSA value (void in LLVM); matches IRBranch/IRRet convention
+# by omitting `dest`. Existing `hasproperty(inst, :dest)` guards in lower.jl /
+# dep_dag.jl / liveness analysis handle dest-less instructions uniformly.
+struct IRStore <: IRInst
+    ptr::IROperand      # destination pointer (SSA, resolved via vw)
+    val::IROperand      # value to store (SSA or constant)
+    width::Int          # stored value width in bits (i1-aware via narrow guard)
+end
+
+# IRAlloca produces a pointer SSA value. `n_elems::IROperand` mirrors
+# IRVarGEP.index — :const for static allocas, :ssa for dynamic. Static-only at
+# lower time; dynamic is rejected with a clear error until a shadow-memory or
+# conservative-upper-bound strategy is implemented (T3b).
+struct IRAlloca <: IRInst
+    dest::Symbol         # SSA name of produced pointer
+    elem_width::Int      # bit width per element
+    n_elems::IROperand   # :const for static, :ssa for dynamic
+end
+
 struct IRExtractValue <: IRInst
     dest::Symbol
     agg::IROperand       # aggregate operand

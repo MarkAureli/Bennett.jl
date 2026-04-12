@@ -173,6 +173,15 @@ end
 function _ssa_operands(inst::IRLoad)
     inst.ptr.kind == :ssa ? [inst.ptr.name] : Symbol[]
 end
+function _ssa_operands(inst::IRStore)
+    ops = Symbol[]
+    inst.ptr.kind == :ssa && push!(ops, inst.ptr.name)
+    inst.val.kind == :ssa && push!(ops, inst.val.name)
+    return ops
+end
+function _ssa_operands(inst::IRAlloca)
+    inst.n_elems.kind == :ssa ? [inst.n_elems.name] : Symbol[]
+end
 function _ssa_operands(inst::IRSwitch)
     inst.cond.kind == :ssa ? [inst.cond.name] : Symbol[]
 end
