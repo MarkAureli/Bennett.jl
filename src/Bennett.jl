@@ -69,9 +69,12 @@ function _narrow_ir(parsed::ParsedIR, W::Int)
     return ParsedIR(W, new_args, new_blocks, [W for _ in parsed.ret_elem_widths])
 end
 
-_narrow_inst(inst::IRBinOp, W::Int) = IRBinOp(inst.dest, inst.op, inst.op1, inst.op2, W)
-_narrow_inst(inst::IRICmp, W::Int) = IRICmp(inst.dest, inst.predicate, inst.op1, inst.op2, W)
-_narrow_inst(inst::IRSelect, W::Int) = IRSelect(inst.dest, inst.cond, inst.op1, inst.op2, W)
+# i1 boolean values (from icmp, short-circuit &&/||, boolean ternaries) must
+# stay i1 under narrowing — the width is logical, not numeric. Matches the
+# IRPhi / IRCast guard.
+_narrow_inst(inst::IRBinOp, W::Int) = IRBinOp(inst.dest, inst.op, inst.op1, inst.op2, inst.width > 1 ? W : 1)
+_narrow_inst(inst::IRICmp, W::Int) = IRICmp(inst.dest, inst.predicate, inst.op1, inst.op2, inst.width > 1 ? W : 1)
+_narrow_inst(inst::IRSelect, W::Int) = IRSelect(inst.dest, inst.cond, inst.op1, inst.op2, inst.width > 1 ? W : 1)
 _narrow_inst(inst::IRCast, W::Int) = IRCast(inst.dest, inst.op, inst.operand,
                                              inst.from_width > 1 ? W : 1,
                                              inst.to_width > 1 ? W : 1)

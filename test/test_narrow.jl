@@ -75,4 +75,19 @@ using Bennett
         end
         @test verify_reversibility(c)
     end
+
+    @testset "narrow with compound boolean predicate (i1 IRBinOp)" begin
+        # && on two i1 comparison results lowers to `and i1 %a, %b` in LLVM IR.
+        # Regression test for _narrow_inst(::IRBinOp) — previously narrowed the
+        # width unconditionally, so the i1 operands of the and became i3 while
+        # resolve! still returned only 1 wire, crashing lower_and! in the loop
+        # over 1:W. Predicate is chosen width-agnostic (== is not signed/unsigned).
+        f(x::Int8) = Int8((x != Int8(0) && x != Int8(5)) ? 1 : 0)
+        c = reversible_compile(f, Int8; bit_width=3)
+        for x in 0:7
+            expected = (x != 0 && x != 5) ? Int8(1) : Int8(0)
+            @test simulate(c, Int8(x)) == expected
+        end
+        @test verify_reversibility(c)
+    end
 end

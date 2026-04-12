@@ -2383,3 +2383,29 @@ Added to `test/test_narrow.jl` — the exact reproduction case (`Int8(x == 5 ? 1
 - `src/Bennett.jl` line 75: one-line fix
 - `test/test_narrow.jl`: regression testset
 - `WORKLOG.md`: this entry
+
+## 2026-04-12 — Fix _narrow_inst for IRBinOp/IRICmp/IRSelect on i1 (Bennett-wl8)
+
+### The bug
+
+Same class as Bennett-z9y, different instruction types. `_narrow_inst` for `IRBinOp`, `IRICmp`, `IRSelect` unconditionally replaced `width` with W. For i1 boolean values (icmp results, `&&`/`||` short-circuit, boolean ternaries), this is wrong — booleans don't narrow.
+
+Concrete failure (reported by Sturm.jl): `Int8((x > 5 && (x & Int8(1)) == 1) ? 1 : 0)` at `bit_width=3`. Julia's `&&` on two `icmp` results lowers to `and i1 %0, %.not`. After narrowing, the `and` has `width=3` but its operands are still 1-wire icmp results — `lower_and!` loops `1:W` and over-indexes the 1-element operand vector.
+
+### Fix
+
+Same guard as `_narrow_inst(::IRPhi)` and `_narrow_inst(::IRCast)`:
+
+```julia
+_narrow_inst(inst::IRBinOp, W::Int) = IRBinOp(inst.dest, inst.op, inst.op1, inst.op2, inst.width > 1 ? W : 1)
+_narrow_inst(inst::IRICmp, W::Int) = IRICmp(inst.dest, inst.predicate, inst.op1, inst.op2, inst.width > 1 ? W : 1)
+_narrow_inst(inst::IRSelect, W::Int) = IRSelect(inst.dest, inst.cond, inst.op1, inst.op2, inst.width > 1 ? W : 1)
+```
+
+### Rule (for future narrowing-related code)
+
+**i1 is logical width, not numeric width.** Any IR instruction with a `width` field that can be 1 (from boolean predicates) needs the `width > 1 ? W : 1` guard. This now covers every IR type in `_narrow_inst` that carries a width.
+
+### Regression test
+
+`test/test_narrow.jl`: `Int8((x != Int8(0) && x != Int8(5)) ? 1 : 0)` at `bit_width=3`. Uses `!=` so the predicate is width-agnostic (equality doesn't differ between signed and unsigned interpretations at narrow widths).
