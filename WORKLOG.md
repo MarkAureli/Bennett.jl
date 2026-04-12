@@ -3224,3 +3224,61 @@ annotated = read(pipe, String)
 - End-to-end `run_memssa(f, arg_types)` on a Julia function with allocas
 - No-op behavior for memory-free functions
 - `use_memory_ssa=true` kwarg round-trip through `extract_parsed_ir`
+
+## 2026-04-12 — T2a.3: integration tests — cases T0 misses (Bennett-08wr)
+
+### Scope
+
+Demonstrate that for memory patterns T0 preprocessing (sroa / mem2reg /
+simplifycfg / instcombine) cannot fully eliminate, MemorySSA's Def/Use/Phi
+graph captures the necessary information to drive a correct lowering. Wiring
+that info into `lower_load!` for actual gate-count wins is a follow-up (filed
+as implicit technical debt — `ctx.memssa` is populated but currently unused
+by lowering decisions).
+
+### Test file — `test/test_memssa_integration.jl`
+
+23 assertions across 5 patterns:
+
+1. **var-index load into local array** — SROA cannot split an alloca accessed
+   by a runtime index. After preprocessing, stores/loads survive; MemorySSA
+   annotates each with Def/Use IDs.
+
+2. **conditional store in diamond CFG produces MemoryPhi** — The canonical
+   paper-winning case: `if cond; a[i] = x; end; a[i]`. Memssa synthesizes a
+   `MemoryPhi` at the merge block, telling us the load's value depends on
+   which branch was taken — info that `ptr_provenance` currently loses.
+
+3. **sequential stores + load** — Multiple stores to the same `Ref`; each
+   store creates a distinct MemoryDef, the load's MemoryUse points to the
+   final one. Demonstrates clobber-chain walking.
+
+4. **memssa-off matches T0 behavior exactly** — Regression guard: turning on
+   `use_memory_ssa` doesn't mutate the walked IR (same blocks, args, ret_width).
+   Pure addition via the `parsed.memssa` field.
+
+5. **annotation graph consistency** — Every Use's referenced Def ID exists in
+   `def_clobber` (or is the live-on-entry sentinel `0`). Every Def's clobber
+   target exists. No dangling IDs — confirms parser integrity against a real
+   Julia function's memssa output.
+
+### Gotcha: SROA + loop = vector instructions
+
+Originally included a `for k in 1:4; s += a[k]; end` test case. With
+`preprocess=true`, SROA splits the 4-element array into an `<i8 x 4>` vector
+and emits `insertelement` / `extractelement` — which our IR walker doesn't
+handle. Switched to a `Ref` pattern (scalar alloca) to avoid vectorization.
+
+Vector-instruction support is separate (Bennett-vb2 per the VISION PRD
+Tier 4). Filed implicit as future work.
+
+### Expected follow-up work (not in scope for T2a.3)
+
+- Wire `ctx.memssa.use_at_line[line]` into `lower_load!`: when present and
+  the referenced Def is a specific store, look up that store's value in `vw`
+  and alias-copy. When it's a `MemoryPhi`, construct a value-phi at load time.
+- Correlate memssa's line-indexed annotations with LLVM.jl's instruction walk
+  (currently keyed by text-line position in the annotated IR — will need a
+  second pass that matches instructions by their textual form).
+- Gate-count benchmark on cases (1) and (2): measure whether memssa-informed
+  lowering beats our current heuristic `ptr_provenance`.
