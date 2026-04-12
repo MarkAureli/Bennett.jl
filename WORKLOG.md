@@ -3568,3 +3568,122 @@ Shadow is ~300× cheaper per static-idx op than MUX EXCH — and this is now
 the DEFAULT path whenever idx is known at compile time. Real Julia code
 with local array initialization (N static-idx stores + dynamic-idx read)
 now pays only N · 3W CNOT for the writes rather than N · 7k gates.
+
+---
+
+## Session close — 2026-04-12 (second-of-day, memory plan push)
+
+### Shipped this session (13 issues closed)
+
+| Task | Issue | Commit | Deliverable |
+|------|-------|--------|-------------|
+| closed-with-note | Bennett-h8iw | (WORKLOG) | Cuccaro dispatch misdiagnosis analysis |
+| filed follow-up | Bennett-gsxe | (new) | 2n-3 Toffoli optimization for `lower_add_cuccaro!` |
+| T1c.1 | Bennett-hz31 | b9d6183 | Babbush-Gidney QROM primitive |
+| T1c.2 | Bennett-za54 | 726a494 | `lower_var_gep!` dispatches const tables to QROM |
+| T1c.3 | Bennett-qw8k | 64bd85a | QROM vs MUX scaling benchmark |
+| T2a.1 | Bennett-law3 | c560eb9 | MemorySSA investigation doc |
+| T2a.2 | Bennett-81bs | c560eb9 | `src/memssa.jl` + `use_memory_ssa` kwarg |
+| T2a.3 | Bennett-08wr | ab6b52e | MemorySSA integration tests (cases T0 misses) |
+| T3a.1 | Bennett-bdni | cba1b42 | 4-round Feistel reversible hash |
+| T3a.2 | Bennett-tqik | faf066d | Feistel vs Okasaki benchmark |
+| T3b.1 | Bennett-oy9e | e16cf22 | Shadow memory protocol design doc |
+| T3b.2 | Bennett-2ayo | e16cf22 | Shadow memory primitives |
+| T3b.3 | Bennett-10rm | 65238e7 | Universal memory dispatcher |
+| BC.4  | Bennett-6c8y | 592a8fb | BENCHMARKS.md extended head-to-head |
+
+Test suite: all green (0 failures, 0 errors). Memory plan critical path
+complete. `bd stats`: 127 closed / 52 open / 0 in-progress.
+
+### Headline results
+
+- **QROM** (T1c): 4(L-1) Toffoli post-Bennett, W-independent. 134× smaller
+  than MUX tree at L=4 W=8 (56 gates vs 7,514). End-to-end: a Julia tuple
+  lookup `f(x) = let tbl=(...); tbl[(x&m)+1]; end` compiles to a few hundred
+  gates instead of the thousands our old MUX path emitted.
+- **Feistel** (T3a): 8W Toffoli post-Bennett. 148× smaller than Okasaki
+  persistent RB-tree's 71k gates per 3-node insert.
+- **Shadow memory** (T3b): 3W CNOT per store, W CNOT per load, zero Toffoli
+  from the mechanism. 297× smaller than MUX EXCH per op. Activates
+  automatically for static-idx writes.
+- **Universal dispatcher** (T3b.3): picks the cheapest correct strategy
+  per operation. Mixed-strategy functions (e.g., static-idx init + dynamic
+  read) work end-to-end.
+- **MemorySSA** (T2a): parser + ingest + 23 integration tests. Paper-winning
+  narrative unlocked: "first compiler to consume LLVM MemorySSA for
+  reversible-memory analysis."
+
+### What's left on the memory plan
+
+The critical path is complete; what remains is supporting infrastructure
+and benchmarks, all lower priority:
+
+- **T0.3 Bennett-glh** (P2) — integrate Julia's EscapeAnalysis for
+  allocation-site classification; complementary to the universal dispatcher's
+  runtime decisions.
+- **T0.4 Bennett-c68** (P2) — 20-function corpus benchmark to measure
+  store/alloca elimination rate empirically.
+- **BC.3 Bennett-xy75** (P2) — full SHA-256 (not just round) benchmark;
+  stress-test at ~30K gates.
+- **T2b Bennett-k4q3 / e5ke** (P3) — `@linear` macro + mechanical reversal
+  of linear functions. Orthogonal to the memory strategies (a 5th strategy
+  once landed, but separate workstream).
+
+Paper tasks (P.1/P.2) still explicitly deferred per user direction —
+implementation and benchmarking before drafting.
+
+### What's left but didn't fit — noted follow-ups
+
+- **Wire MemorySSA into `lower_load!`** — currently `parsed.memssa` is
+  populated when the kwarg is set but `_lower_load_via_mux!` doesn't consult
+  it. Doing so would let us correctly handle conditional stores that
+  currently fall through to MUX EXCH (losing the branch-dependent value info).
+- **SAT-pebbling scheduler for shadow tape slots** — shadow primitives expose
+  the right interface (one slot per store, pebbleable) but
+  `src/sat_pebbling.jl` isn't yet taught to schedule them. Design doc
+  covers this (§4.5).
+- **Non-power-of-two L for QROM** — current MVP restriction. Paper Fig 3 §III.A
+  shows the truncation trick; easy extension when needed for a specific
+  benchmark.
+- **Cuccaro + Bennett self-reversing optimization** (Bennett-07r) — our
+  in-place adder is self-uncomputing so Bennett reverse is redundant.
+  Halves MD5 Toffoli count when fixed. Architectural change to bennett.jl.
+- **Dynamic-idx shadow** — current shadow handles only static idx; dynamic
+  would require MUX-select-among-tape-slots. Feasible extension.
+- **Tighten `lower_add_cuccaro!` to paper-optimal 2n-3 Toffoli** (Bennett-gsxe).
+
+### Gotchas learned (new since prior WORKLOG session)
+
+1. **`LLVM.initializer(g)` can throw on non-ConstantData globals** —
+   Julia emits type-reference globals (GlobalAlias etc.) that `initializer`
+   can't resolve. Wrap in try/catch in any global-scanning code.
+2. **Module-level `const tbl = (...)` doesn't inline** — creates a
+   free-variable lookup in the function body, not a private constant
+   global. For QROM dispatch, tuples must be declared inside the function
+   via `let`.
+3. **`IOBuffer` doesn't work with `redirect_stderr`** — use `Pipe()`, and
+   remember to `close(pipe.in)` after the pass runs before reading.
+4. **SROA can vectorize arrays in loops** — emits `insertelement` /
+   `extractelement` which our IR walker doesn't support. Use `Ref` patterns
+   instead of arrays for memssa integration tests.
+5. **`length(ops) == 2` GEP skip path** silently drops globals in the raw
+   IR — the Case B global-base branch we added is critical for QROM
+   dispatch.
+
+### Protocol for next agent
+
+Memory plan critical path is done — don't re-open those tasks. The four
+strategies (MUX EXCH, QROM, Feistel, Shadow) + universal dispatcher are the
+design; build the remaining work on top of them.
+
+If someone wants to tackle "really complete" round 2, the highest-leverage
+next steps are:
+1. **Wire MemorySSA into `lower_load!`** — turns the T2a infrastructure
+   from diagnostic into functional. Likely ~100 LOC change in `lower.jl`.
+2. **BC.3 full SHA-256** — will reveal whether our memory strategies scale.
+   PRS15 Table II published comparison numbers available.
+3. **Bennett-07r Cuccaro self-reversing** — halves Toffoli count on any
+   adder-heavy benchmark (MD5, SHA, crypto). Architectural change to
+   `bennett.jl` — mark Cuccaro-group gates as "skip Bennett reverse."
+
+Everything else is polish.
