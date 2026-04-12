@@ -2409,3 +2409,29 @@ _narrow_inst(inst::IRSelect, W::Int) = IRSelect(inst.dest, inst.cond, inst.op1, 
 ### Regression test
 
 `test/test_narrow.jl`: `Int8((x != Int8(0) && x != Int8(5)) ? 1 : 0)` at `bit_width=3`. Uses `!=` so the predicate is width-agnostic (equality doesn't differ between signed and unsigned interpretations at narrow widths).
+
+## 2026-04-12 — Memory plan T0.1: LLVM pass pipeline control (Bennett-3pa)
+
+### What was built
+
+`extract_parsed_ir` gains a `passes::Union{Nothing,Vector{String}}=nothing` kwarg. When supplied, the named LLVM New-Pass-Manager passes run on the parsed module before walking. Plumbing only; T0.2 will set defaults.
+
+### API
+
+```julia
+extract_parsed_ir(f, T; passes=["sroa", "mem2reg", "simplifycfg"])
+```
+
+Pass names are canonical LLVM NPM pipeline strings (see llvm.org/docs/NewPassManager.html). Use `","`-separated subpipelines if needed; internally we join with `,` and hand to `NewPMPassBuilder` + `run!(pb, mod)`.
+
+### LLVM.jl API we rely on
+
+- `LLVM.NewPMPassBuilder()` — pass builder
+- `LLVM.add!(pb, pipeline_string)` — register a pipeline
+- `LLVM.run!(pb, mod)` — execute on a module
+
+LLVM.jl 9.4.6 on Julia 1.12.3 has these as public API. The old legacy pass manager (`ModulePassManager`) is also present but deprecated in upstream LLVM; stick with NewPM.
+
+### Test
+
+`test/test_preprocessing.jl` (new): 263 assertions covering backward compat (`passes=nothing` matches old behavior), custom passes execute without error, empty pass list is a no-op, and `reversible_compile` still passes full 256-input sweep on `x + Int8(3)`.

@@ -11,21 +11,43 @@ function extract_ir(f, arg_types::Type{<:Tuple}; optimize::Bool=true)
 end
 
 """
-    extract_parsed_ir(f, arg_types; optimize=true) -> ParsedIR
+    extract_parsed_ir(f, arg_types; optimize=true, passes=nothing) -> ParsedIR
 
 Extract LLVM IR via LLVM.jl's typed API and convert to ParsedIR.
 Uses dump_module=true to include function declarations needed for call inlining.
+
+`passes` is an optional `Vector{String}` of LLVM New-Pass-Manager pipeline names
+(e.g. `["sroa", "mem2reg", "simplifycfg"]`) to run on the parsed module before
+walking. Useful for driving memory-elimination passes (SROA, mem2reg) ahead of
+the IR walker. When `nothing` (default), no extra passes are run — behavior is
+identical to previous versions.
 """
-function extract_parsed_ir(f, arg_types::Type{<:Tuple}; optimize::Bool=true)
+function extract_parsed_ir(f, arg_types::Type{<:Tuple};
+                           optimize::Bool=true,
+                           passes::Union{Nothing,Vector{String}}=nothing)
     ir_string = sprint(io -> code_llvm(io, f, arg_types; debuginfo=:none, optimize, dump_module=true))
 
     local result::ParsedIR
     LLVM.Context() do _ctx
         mod = parse(LLVM.Module, ir_string)
+        if passes !== nothing && !isempty(passes)
+            _run_passes!(mod, passes)
+        end
         result = _module_to_parsed_ir(mod)
         dispose(mod)
     end
     return result
+end
+
+# Run LLVM New-Pass-Manager passes on `mod` in order. Pass names must be the
+# canonical NPM strings LLVM accepts (e.g. "sroa", "mem2reg", "simplifycfg").
+function _run_passes!(mod::LLVM.Module, passes::Vector{String})
+    pipeline = join(passes, ",")
+    @dispose pb = LLVM.NewPMPassBuilder() begin
+        LLVM.add!(pb, pipeline)
+        LLVM.run!(pb, mod)
+    end
+    return nothing
 end
 
 # ---- known callee registry for gate-level inlining ----
