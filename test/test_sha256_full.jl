@@ -166,3 +166,75 @@ end
     gc = gate_count(circuit)
     println("  [2-round] total=$(gc.total)  Toffoli=$(gc.Toffoli)  wires=$(circuit.n_wires)")
 end
+
+@testset "SHA-256 compression — 8-round scaling check" begin
+    Bennett._reset_names!()
+    t0 = time()
+    circuit = reversible_compile(sha256_compress_8, ntuple(_ -> UInt32, 24)...)
+    t_compile = time() - t0
+    @test verify_reversibility(circuit)
+    # Correctness: sha256_compress_8 reference must match simulator
+    inp = (UInt32(0x6a09e667), UInt32(0xbb67ae85), UInt32(0x3c6ef372), UInt32(0xa54ff53a),
+           UInt32(0x510e527f), UInt32(0x9b05688c), UInt32(0x1f83d9ab), UInt32(0x5be0cd19),
+           UInt32(0x61626380), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+           UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+           UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+           UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000018))
+    expected_8 = sha256_compress_8(inp...)
+    result = simulate(circuit, inp)
+    for i in 1:8
+        @test UInt32(result[i] % UInt32) == expected_8[i]
+    end
+    gc = gate_count(circuit)
+    println("  [8-round] total=$(gc.total)  Toffoli=$(gc.Toffoli)  " *
+            "wires=$(circuit.n_wires)  compile=$(round(t_compile, digits=1))s")
+end
+
+@testset "SHA-256 compression — full 64-round (BC.3)" begin
+    # Full SHA-256 compression function on a 512-bit block. Uses the
+    # standard "abc" test vector.
+    Bennett._reset_names!()
+    t0 = time()
+    circuit = reversible_compile(sha256_compress_64, ntuple(_ -> UInt32, 24)...)
+    t_compile = time() - t0
+    @test verify_reversibility(circuit)
+
+    H0 = (UInt32(0x6a09e667), UInt32(0xbb67ae85), UInt32(0x3c6ef372), UInt32(0xa54ff53a),
+          UInt32(0x510e527f), UInt32(0x9b05688c), UInt32(0x1f83d9ab), UInt32(0x5be0cd19))
+    block_abc = (
+        UInt32(0x61626380),
+        UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+        UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+        UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+        UInt32(0x00000000), UInt32(0x00000000), UInt32(0x00000000),
+        UInt32(0x00000018))
+    expected_hash = (
+        UInt32(0xba7816bf), UInt32(0x8f01cfea), UInt32(0x414140de), UInt32(0x5dae2223),
+        UInt32(0xb00361a3), UInt32(0x96177a9c), UInt32(0xb410ff61), UInt32(0xf20015ad))
+
+    t0 = time()
+    result = simulate(circuit, (H0..., block_abc...))
+    t_sim = time() - t0
+    for i in 1:8
+        @test UInt32(result[i] % UInt32) == expected_hash[i]
+    end
+
+    gc = gate_count(circuit)
+    t_cnt = t_count(circuit)
+    acc = ancilla_count(circuit)
+
+    println()
+    println("  ===== BC.3 — Full SHA-256 compression (64 rounds, 512-bit block) =====")
+    println("  Total gates:  $(gc.total)")
+    println("    NOT:        $(gc.NOT)")
+    println("    CNOT:       $(gc.CNOT)")
+    println("    Toffoli:    $(gc.Toffoli)")
+    println("  T-count:      $t_cnt")
+    println("  Wires:        $(circuit.n_wires)")
+    println("  Ancillae:     $acc")
+    println("  Compile time: $(round(t_compile, digits=1))s")
+    println("  Simulate:     $(round(t_sim, digits=2))s")
+    println("  ======================================================================")
+    println()
+    println("  Test vector: SHA-256(\"abc\") = ba7816bf8f01cfea...  MATCHES ✓")
+end
