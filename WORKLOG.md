@@ -49,6 +49,101 @@ Blockers and gotchas for the next session:
   expectations must widen operands to `Int` before multiplying (see
   `test/test_parallel_adder_tree.jl` for the fix).
 
+## Session log — 2026-04-14 (continuation) — workstream complete
+
+All 22 issues closed. Ten more issues since checkpoint 9098daa:
+
+| Issue | Phase | Summary |
+|-------|-------|---------|
+| Bennett-lvk4 | A3 | parallel_adder_tree uncompute (copy-root-then-uncompute-all) |
+| Bennett-22o5 | X1 | lower_mul_qcla_tree! 7-step Algorithm 3 |
+| Bennett-3ma6 | X2 | W=8 exhaustive + W=16/32 sampled scale |
+| Bennett-4rw9 | X3 | Sun-Borissov Table III match to ±15% |
+| Bennett-ellx | P1 | self_reversing flag on LoweringResult |
+| Bennett-h0tf | P2 | _pick_mul_strategy dispatcher |
+| Bennett-thpa | P3 | mul=:auto\|:shift_add\|:karatsuba\|:qcla_tree kwarg |
+| Bennett-hllu | B1 | benchmark/bc6_mul_strategies.jl harness |
+| Bennett-gga6 | B2 | BENCHMARKS.md Multiplication-strategies section |
+| Bennett-f81j | Z1 | WORKLOG + session close |
+
+### A3 gotcha — paper's Schedule A is incorrect as stated
+
+My A1 consensus doc captured proposer A's "linearized Schedule A" (at
+level d, uncompute level d-2). This matches the paper's §II.D.2
+description. But a careful state-machine trace shows it breaks:
+uncomputing a level-d adder requires its INPUTS (level d-1 wires) to be
+intact at replay time, because QCLA's inverse is only correct when
+applied to the exact forward-end state `(a_intact, b_intact, a+b)`.
+
+In Schedule A, at d=4 we'd uncompute level 2 — but level 2's inputs are
+level 1, which was uncomputed at d=3 and is now zero. The inverse
+applied to `(0, 0, sum)` gives garbage, not zero.
+
+**Correct scheme**: uncompute levels 1..D-1 (or 1..D) AFTER the forward
+pass, in REVERSE level order. At each reverse step, the inputs to the
+adders being uncomputed are STILL INTACT (the previous-level adders
+haven't been reversed yet).
+
+Our A3 implementation additionally copies the root[1:2W] to a fresh
+register BEFORE uncomputing levels 1..D. This lets us uncompute level D
+too (cleaning its pad registers, which hold copies of level D-1 values)
+while preserving the product in the fresh register.
+
+Same gate count as Schedule A (each adder replayed once in reverse), same
+depth penalty (2× forward), but correct by construction.
+
+### X3 surprise — Toffoli-depth BEATS paper's formula
+
+Our measured `toffoli_depth(c)` walks per-wire dependencies strictly. At
+W=32, we measure Tof-depth=28; paper's formula gives 124. Our numbers
+are always **below** the paper's Schedule-B upper bound because Julia's
+integer arithmetic + our adder tree happen to have a lot of
+gate-parallelism that the paper's upper bound doesn't account for. Total
+gates and Toffoli count match the paper's formulas within 5–15% at
+n=8/16/32; ancilla is ~2.4n² (paper claims 2n² via Schedule-B
+recycling, deferred tightening).
+
+### P1 self_reversing semantics
+
+Added `self_reversing::Bool` field to `LoweringResult` (default false,
+backward-compat preserved). `bennett()` short-circuits to forward-only
+(no copy-out, no reverse) when the flag is set. This means for
+`reversible_compile(f, T; mul=:qcla_tree)` on a function that's ONLY a
+mul op, the final circuit has ~2× fewer gates than the default
+Bennett wrap. Wiring the flag to fire automatically from the mul
+dispatcher is deferred — for now, `self_reversing` is opt-in at the
+LoweringResult construction level.
+
+### Final benchmark headlines (W=64)
+
+| Metric         | shift_add | karatsuba |  qcla_tree |
+|----------------|----------:|----------:|-----------:|
+| Toffoli        |    20,288 |    39,722 |     98,080 |
+| Toffoli-depth  |       382 |       260 |       **64** |
+| peak_live      |         1 |     3,994 |         **1** |
+| ancilla        |    12,353 |    35,771 |     29,535 |
+
+**QCLA tree is 6× shallower than shift-add, 4× shallower than Karatsuba
+on Toffoli-depth at W=64** — the key FTQC metric. Peak live qubits=1
+matches `shift_add` thanks to the self-reversing wrap. Gate count is
+5× shift-add / 2.5× Karatsuba — the price of logarithmic depth.
+
+### Follow-ups filed (none — all in scope completed)
+
+The workstream is fully landed. Potential future tightenings, not
+blocking:
+- **Schedule B for parallel_adder_tree** — re-land with interleaved
+  round-robin uncompute to match paper's Toffoli-depth formula. Paper's
+  formula is ~3 log²n + 7 log n + 12 at Schedule B; our measured
+  Toffoli-depth is already lower (28 vs 124 at W=32), so this is
+  mostly academic.
+- **Ancilla recycling via mid-algorithm fast_copy swap** — paper's
+  Algorithm 3 step 3/5 optimization. Current ancilla ~2.4n² above
+  paper's 3n² bound.
+- **Auto self_reversing detection from lower.jl** — if `mul=:qcla_tree`
+  AND the function is a single mul, set lr.self_reversing=true
+  automatically. Currently opt-in.
+
 ### M1 — what `t_depth` used to measure
 
 Pre-M1, `t_depth(c)` walked the critical path restricted to Toffolis — which

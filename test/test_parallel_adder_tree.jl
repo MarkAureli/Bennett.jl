@@ -108,6 +108,74 @@ end
     @test length(result) == 8
 end
 
+@testset "parallel_adder_tree: ancillae zero after tree (A3 uncompute)" begin
+    # After emit_parallel_adder_tree!, only the returned root register holds
+    # values; every other wire allocated during the tree must be back to zero.
+    for (x, y) in [(5, 11), (15, 15), (8, 3), (0, 0), (1, 1)]
+        wa = WireAllocator()
+        x_src = allocate!(wa, 4); y_src = allocate!(wa, 4)
+        gates = Vector{ReversibleGate}()
+        x_copies = emit_fast_copy!(gates, wa, x_src, 4, 4)
+        y_bit_copies = Vector{Vector{Int}}()
+        for i in 1:4
+            yi = allocate!(wa, 4)
+            for k in 1:4; push!(gates, CNOTGate(y_src[i], yi[k])); end
+            push!(y_bit_copies, yi)
+        end
+        pp = emit_partial_products!(gates, wa, y_bit_copies, x_copies, 4)
+
+        wires_before_tree = wire_count(wa)
+        result = emit_parallel_adder_tree!(gates, wa, pp, 4)
+        wires_after_tree = wire_count(wa)
+
+        bits = zeros(Bool, wires_after_tree)
+        _load!(bits, x_src, x, 4); _load!(bits, y_src, y, 4)
+        _simulate!(bits, gates)
+
+        # Result still correct
+        @test _decode(bits, result) == UInt64(x * y)
+
+        # Every wire allocated by the tree EXCEPT the result wires must be zero
+        result_set = Set(result)
+        dirty = Int[]
+        for w in (wires_before_tree + 1):wires_after_tree
+            if !(w in result_set) && bits[w]
+                push!(dirty, w)
+            end
+        end
+        @test isempty(dirty)
+    end
+end
+
+@testset "parallel_adder_tree: W=8 ancilla-zero sample" begin
+    for (x, y) in [(85, 170), (255, 255), (200, 100)]
+        wa = WireAllocator()
+        x_src = allocate!(wa, 8); y_src = allocate!(wa, 8)
+        gates = Vector{ReversibleGate}()
+        x_copies = emit_fast_copy!(gates, wa, x_src, 8, 8)
+        y_bit_copies = Vector{Vector{Int}}()
+        for i in 1:8
+            yi = allocate!(wa, 8)
+            for k in 1:8; push!(gates, CNOTGate(y_src[i], yi[k])); end
+            push!(y_bit_copies, yi)
+        end
+        pp = emit_partial_products!(gates, wa, y_bit_copies, x_copies, 8)
+        wb = wire_count(wa)
+        result = emit_parallel_adder_tree!(gates, wa, pp, 8)
+        wa_total = wire_count(wa)
+
+        bits = zeros(Bool, wa_total)
+        _load!(bits, x_src, x, 8); _load!(bits, y_src, y, 8)
+        _simulate!(bits, gates)
+
+        @test _decode(bits, result) == UInt64(Int(x) * Int(y))
+
+        result_set = Set(result)
+        dirty = count(w -> !(w in result_set) && bits[w], (wb + 1):wa_total)
+        @test dirty == 0
+    end
+end
+
 @testset "parallel_adder_tree: input partial products unchanged" begin
     # pp entries must be read-only: after emit_parallel_adder_tree!, the
     # values in the pp wires match what the partial_products stage produced.

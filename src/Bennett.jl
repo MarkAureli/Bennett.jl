@@ -29,6 +29,7 @@ include("shadow_memory.jl")
 include("fast_copy.jl")
 include("partial_products.jl")
 include("parallel_adder_tree.jl")
+include("mul_qcla_tree.jl")
 
 export reversible_compile, simulate, extract_ir, parse_ir, extract_parsed_ir, register_callee!
 export soft_fadd, soft_fsub, soft_fmul, soft_fdiv, soft_fneg, soft_fcmp_olt, soft_fcmp_oeq, soft_fcmp_ole, soft_fcmp_une, soft_fptosi, soft_sitofp
@@ -47,12 +48,12 @@ Uses LLVM.jl to walk the IR as typed objects (no regex parsing).
 function reversible_compile(f, arg_types::Type{<:Tuple};
                             optimize::Bool=true, max_loop_iterations::Int=0,
                             compact_calls::Bool=false, bit_width::Int=0,
-                            add::Symbol=:auto)
+                            add::Symbol=:auto, mul::Symbol=:auto)
     parsed = extract_parsed_ir(f, arg_types; optimize)
     if bit_width > 0
         parsed = _narrow_ir(parsed, bit_width)
     end
-    lr = lower(parsed; max_loop_iterations, compact_calls, add)
+    lr = lower(parsed; max_loop_iterations, compact_calls, add, mul)
     return bennett(lr)
 end
 

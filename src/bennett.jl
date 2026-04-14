@@ -21,6 +21,14 @@ Tracks constant_wires from the lowering result for future optimization
 (activity analysis, shared constant allocation).
 """
 function bennett(lr::LoweringResult)
+    # P1: self-reversing primitives (e.g. Sun-Borissov multiplier) already
+    # end with ancillae clean and the result in lr.output_wires. Skip the
+    # copy-out + reverse pass — it would just double the gate count.
+    if lr.self_reversing
+        return _build_circuit(copy(lr.gates), lr.n_wires, lr.input_wires,
+                              lr.output_wires, lr)
+    end
+
     n_out = length(lr.output_wires)
     copy_start = lr.n_wires + 1
     copy_wires = collect(copy_start:copy_start + n_out - 1)

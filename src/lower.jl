@@ -27,13 +27,24 @@ struct LoweringResult
     output_elem_widths::Vector{Int}
     constant_wires::Set{Int}       # wires carrying compile-time constants
     gate_groups::Vector{GateGroup} # SSA instruction → gate range mapping
+    # P1: if true, the entire gate sequence is a self-cleaning primitive
+    # (e.g. Sun-Borissov `lower_mul_qcla_tree!`). `bennett()` honors this
+    # by returning the forward gates only — no copy-out, no reverse.
+    self_reversing::Bool
 end
 
 # Backward-compatible 7-arg constructor (existing call sites still work)
 LoweringResult(gates, n_wires, input_wires, output_wires,
                input_widths, output_elem_widths, constant_wires) =
     LoweringResult(gates, n_wires, input_wires, output_wires,
-                   input_widths, output_elem_widths, constant_wires, GateGroup[])
+                   input_widths, output_elem_widths, constant_wires, GateGroup[], false)
+
+# 8-arg constructor (legacy, pre-P1)
+LoweringResult(gates, n_wires, input_wires, output_wires,
+               input_widths, output_elem_widths, constant_wires,
+               gate_groups::Vector{GateGroup}) =
+    LoweringResult(gates, n_wires, input_wires, output_wires,
+                   input_widths, output_elem_widths, constant_wires, gate_groups, false)
 
 """Bundles shared lowering state for instruction dispatch."""
 struct LoweringCtx
@@ -56,6 +67,8 @@ struct LoweringCtx
     globals::Dict{Symbol, Tuple{Vector{UInt64}, Int}}          # global name → (data, elem_width)
     # D1: add-op strategy dispatcher (:auto, :ripple, :cuccaro, :qcla)
     add::Symbol
+    # P2/P3: mul-op strategy dispatcher (:auto, :shift_add, :karatsuba, :qcla_tree)
+    mul::Symbol
 end
 
 # Backward-compatible constructor: existing sites don't need to pass the new fields.
@@ -67,7 +80,7 @@ LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
                 Dict{Symbol,Tuple{Symbol,IROperand}}(),
                 Ref(0),
                 Dict{Symbol,Tuple{Vector{UInt64},Int}}(),
-                :auto)
+                :auto, :auto)
 
 # 12-arg constructor for callers that want to pass globals explicitly.
 LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
@@ -84,14 +97,15 @@ LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
 # 13-arg constructor: adds the add-strategy field.
 LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
             block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
-            globals::Dict{Symbol,Tuple{Vector{UInt64},Int}}, add::Symbol) =
+            globals::Dict{Symbol,Tuple{Vector{UInt64},Int}}, add::Symbol,
+            mul::Symbol=:auto) =
     LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
                 block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
                 Dict{Symbol,Tuple{Int,Int}}(),
                 Dict{Symbol,Tuple{Symbol,IROperand}}(),
                 Ref(0),
                 globals,
-                add)
+                add, mul)
 
 # Dispatched instruction lowering — Julia selects the method by inst type
 _lower_inst!(ctx::LoweringCtx, inst::IRPhi, label::Symbol) =
@@ -101,7 +115,7 @@ _lower_inst!(ctx::LoweringCtx, inst::IRPhi, label::Symbol) =
 _lower_inst!(ctx::LoweringCtx, inst::IRBinOp, ::Symbol) =
     lower_binop!(ctx.gates, ctx.wa, ctx.vw, inst;
                  ssa_liveness=ctx.ssa_liveness, inst_idx=ctx.inst_counter[],
-                 use_karatsuba=ctx.use_karatsuba, add=ctx.add)
+                 use_karatsuba=ctx.use_karatsuba, add=ctx.add, mul=ctx.mul)
 
 _lower_inst!(ctx::LoweringCtx, inst::IRICmp, ::Symbol) =
     lower_icmp!(ctx.gates, ctx.wa, ctx.vw, inst)
@@ -281,9 +295,11 @@ end
 
 function lower(parsed::ParsedIR; max_loop_iterations::Int=0, use_inplace::Bool=true,
                use_karatsuba::Bool=false, fold_constants::Bool=false, compact_calls::Bool=false,
-               add::Symbol=:auto)
+               add::Symbol=:auto, mul::Symbol=:auto)
     add in (:auto, :ripple, :cuccaro, :qcla) ||
         error("lower: unknown add strategy :$add; supported: :auto, :ripple, :cuccaro, :qcla")
+    mul in (:auto, :shift_add, :karatsuba, :qcla_tree) ||
+        error("lower: unknown mul strategy :$mul; supported: :auto, :shift_add, :karatsuba, :qcla_tree")
     wa = WireAllocator()
     gates = ReversibleGate[]
     vw = Dict{Symbol,Vector{Int}}()
@@ -370,7 +386,7 @@ function lower(parsed::ParsedIR; max_loop_iterations::Int=0, use_inplace::Bool=t
         else
             lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_order;
                                block_pred, ssa_liveness, inst_counter, gate_groups,
-                               use_karatsuba, compact_calls, globals=parsed.globals, add)
+                               use_karatsuba, compact_calls, globals=parsed.globals, add, mul)
         end
 
         # Process terminator (for non-loop blocks AND after loop unrolling)
@@ -538,10 +554,10 @@ function lower_block_insts!(gates, wa, vw, block, preds, branch_info, block_orde
                            use_karatsuba::Bool=false,
                            compact_calls::Bool=false,
                            globals::Dict{Symbol,Tuple{Vector{UInt64},Int}}=Dict{Symbol,Tuple{Vector{UInt64},Int}}(),
-                           add::Symbol=:auto)
+                           add::Symbol=:auto, mul::Symbol=:auto)
     ctx = LoweringCtx(gates, wa, vw, preds, branch_info, block_order,
                       block_pred, ssa_liveness, inst_counter, use_karatsuba, compact_calls,
-                      globals, add)
+                      globals, add, mul)
     for inst in block.instructions
         inst_counter[] += 1
         _ws = wa.next_wire
@@ -979,11 +995,27 @@ function _pick_add_strategy(user_choice::Symbol, W::Int, op2_dead::Bool, livenes
     (liveness_enabled && op2_dead) ? :cuccaro : :ripple
 end
 
+"""
+    _pick_mul_strategy(user_choice, W, use_karatsuba) -> Symbol
+
+Resolve `mul=:auto|:shift_add|:karatsuba|:qcla_tree` into a concrete
+strategy. `:auto` preserves the pre-P2 default: Karatsuba when the legacy
+`use_karatsuba` kwarg is set AND W > 4, else shift-and-add. Explicit
+choices bypass the heuristic.
+"""
+function _pick_mul_strategy(user_choice::Symbol, W::Int, use_karatsuba::Bool)
+    user_choice === :shift_add && return :shift_add
+    user_choice === :karatsuba && return :karatsuba
+    user_choice === :qcla_tree && return :qcla_tree
+    user_choice === :auto || error("_pick_mul_strategy: unknown choice :$user_choice")
+    (use_karatsuba && W > 4) ? :karatsuba : :shift_add
+end
+
 function lower_binop!(gates, wa, vw, inst::IRBinOp;
                       ssa_liveness::Dict{Symbol,Int}=Dict{Symbol,Int}(),
                       inst_idx::Int=0,
                       use_karatsuba::Bool=false,
-                      add::Symbol=:auto)
+                      add::Symbol=:auto, mul::Symbol=:auto)
     a = resolve!(gates, wa, vw, inst.op1, inst.width)
     W = inst.width
 
@@ -1019,8 +1051,11 @@ function lower_binop!(gates, wa, vw, inst::IRBinOp;
             end
         elseif inst.op == :sub; lower_sub!(gates, wa, a, b, W)
         elseif inst.op == :mul
-            if use_karatsuba && W > 4
+            mstrat = _pick_mul_strategy(mul, W, use_karatsuba)
+            if mstrat == :karatsuba
                 lower_mul_karatsuba!(gates, wa, a, b, W)
+            elseif mstrat == :qcla_tree
+                lower_mul_qcla_tree!(gates, wa, a, b, W)[1:W]   # mod 2^W
             else
                 lower_mul!(gates, wa, a, b, W)
             end
